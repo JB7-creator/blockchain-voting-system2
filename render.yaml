@@ -2,6 +2,7 @@ services:
   - type: web
     name: devote-ussd-gateway
     env: node
+    plan: free
     rootDir: ussd-gateway
     buildCommand: npm install
     startCommand: node server.js
