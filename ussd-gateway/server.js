@@ -453,9 +453,9 @@ async function findVoter(nationalId) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// USSD ROUTE
+// USSD ROUTE (Handles both /ussd and / POST)
 // ─────────────────────────────────────────────────────────────
-app.post('/ussd', async (req, res) => {
+async function handleUssdRequest(req, res) {
     const { sessionId, phoneNumber, text } = req.body;
     const inputs = (text || '').trim() === '' ? [] : text.split('*');
     let response = '';
@@ -738,7 +738,10 @@ Select Language / Chagua Lugha:
 
     res.set('Content-Type', 'text/plain');
     res.send(response);
-});
+}
+
+app.post('/ussd', handleUssdRequest);
+app.post('/', handleUssdRequest);
 
 // ─────────────────────────────────────────────────────────────
 // ON-CHAIN SETTLEMENT
