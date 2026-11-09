@@ -1243,11 +1243,12 @@ ${t.smsVerify}    : ${explorerUrl}`;
 // ─────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
     res.json({
-        status      : 'DeVote Kenya USSD Gateway – Active',
+        status      : 'DeVote Kenya USSD & Voice Gateway – Active',
         network     : 'Ethereum Sepolia',
         contract    : CONTRACT_ADDRESS,
         frontend    : SITE_URL,
-        endpoint    : `/ussd (POST)`,
+        ussdEndpoint: `/ussd (POST)`,
+        voiceEndpoint: `/voice (POST)`,
         candidates  : candidateCache.length,
         cacheAge_s  : Math.floor((Date.now() - cacheLastUpdated) / 1000)
     });
