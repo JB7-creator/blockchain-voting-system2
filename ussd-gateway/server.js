@@ -744,6 +744,419 @@ app.post('/ussd', handleUssdRequest);
 app.post('/', handleUssdRequest);
 
 // ─────────────────────────────────────────────────────────────
+// AFRICA'S TALKING VOICE IVR (INTERACTIVE AUDIO HOTLINE)
+// ─────────────────────────────────────────────────────────────
+const voiceSessions = new Map();
+
+function xmlEscape(str) {
+    if (!str) return '';
+    return str.toString()
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+}
+
+function voiceXml(sayText, getDigits = null) {
+    if (getDigits) {
+        const numDigits = getDigits.numDigits || 1;
+        const timeout = getDigits.timeout || 10;
+        const finishOnKey = getDigits.finishOnKey || '#';
+        return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <GetDigits timeout="${timeout}" numDigits="${numDigits}" finishOnKey="${finishOnKey}">
+        <Say>${xmlEscape(sayText)}</Say>
+    </GetDigits>
+</Response>`;
+    }
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>${xmlEscape(sayText)}</Say>
+</Response>`;
+}
+
+async function handleVoiceRequest(req, res) {
+    const { sessionId, isActive, direction, callerNumber, dtmfDigits } = req.body;
+    console.log(`[Voice] session=${sessionId} active=${isActive} caller=${callerNumber} dtmf="${dtmfDigits}"`);
+
+    // If call hung up
+    if (isActive === '0') {
+        voiceSessions.delete(sessionId);
+        res.set('Content-Type', 'text/xml');
+        return res.send(`<?xml version="1.0" encoding="UTF-8"?><Response></Response>`);
+    }
+
+    let session = voiceSessions.get(sessionId);
+    let xml = '';
+
+    try {
+        // Step 0: New Call -> Language Selection
+        if (!session) {
+            voiceSessions.set(sessionId, { step: 'LANG_SELECT', callerNumber });
+            xml = voiceXml(
+                'Welcome to DeVote Kenya Blockchain Voting Hotline. For English, press 1. Kwa Kiswahili, bonyeza 2.',
+                { numDigits: 1, timeout: 10 }
+            );
+        }
+
+        // Step 1: Language Chosen -> Main Menu
+        else if (session.step === 'LANG_SELECT') {
+            const lang = (dtmfDigits === '2') ? 'sw' : 'en';
+            session.lang = lang;
+            session.step = 'MAIN_MENU';
+
+            if (lang === 'en') {
+                xml = voiceXml(
+                    'Main menu. Press 1 to cast your vote. Press 2 to check your voter registration status. Press 3 to hear candidates. Press 4 to listen to live results for your area. Press 5 for IEBC support hotline.',
+                    { numDigits: 1, timeout: 12 }
+                );
+            } else {
+                xml = voiceXml(
+                    'Menyu kuu. Bonyeza 1 kupiga kura yako. Bonyeza 2 kuangalia usajili wako. Bonyeza 3 kusikiliza wagombea. Bonyeza 4 kusikiliza matokeo ya eneo lako. Bonyeza 5 kupata msaada wa IEBC.',
+                    { numDigits: 1, timeout: 12 }
+                );
+            }
+        }
+
+        // Step 2: Main Menu Selection
+        else if (session.step === 'MAIN_MENU') {
+            const lang = session.lang;
+
+            // 1: VOTE
+            if (dtmfDigits === '1') {
+                session.step = 'VOTE_ENTER_ID';
+                const prompt = (lang === 'en')
+                    ? 'Please enter your 8-digit National ID followed by the hash key.'
+                    : 'Tafadhali ingiza nambari yako ya kitambulisho cha taifa ya tarakimu nane kisha bonyeza reli.';
+                xml = voiceXml(prompt, { numDigits: 8, timeout: 20, finishOnKey: '#' });
+            }
+
+            // 2: CHECK STATUS
+            else if (dtmfDigits === '2') {
+                session.step = 'STATUS_ENTER_ID';
+                const prompt = (lang === 'en')
+                    ? 'Please enter your National ID followed by hash to check your registration.'
+                    : 'Tafadhali ingiza kitambulisho chako kisha bonyeza reli kuangalia usajili.';
+                xml = voiceXml(prompt, { numDigits: 8, timeout: 20, finishOnKey: '#' });
+            }
+
+            // 3: VIEW CANDIDATES
+            else if (dtmfDigits === '3') {
+                session.step = 'CAND_SELECT_POS';
+                const prompt = (lang === 'en')
+                    ? 'Select position to hear candidates. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for Member of Parliament, 6 for MCA.'
+                    : 'Chagua nafasi kusikia wagombea. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.';
+                xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
+            }
+
+            // 4: VIEW RESULTS
+            else if (dtmfDigits === '4') {
+                session.step = 'RESULTS_ENTER_ID';
+                const prompt = (lang === 'en')
+                    ? 'Please enter your National ID followed by hash to hear results for your registered area.'
+                    : 'Ingiza kitambulisho chako kisha bonyeza reli kusikia matokeo ya eneo lako la kura.';
+                xml = voiceXml(prompt, { numDigits: 8, timeout: 20, finishOnKey: '#' });
+            }
+
+            // 5: HELP
+            else if (dtmfDigits === '5') {
+                voiceSessions.delete(sessionId);
+                const prompt = (lang === 'en')
+                    ? 'The official IEBC toll-free hotline is 0800 221 221. The fraud hotline is 1195. You can also visit our secure voting portal at blockchainvotingsystem026.netlify.app. Thank you for calling DeVote Kenya. Goodbye.'
+                    : 'Nambari ya bure ya IEBC ni 0800 221 221. Nambari ya kuripoti ulaghai ni 1195. Pia unaweza kutembelea tovuti ya blockchainvotingsystem026.netlify.app. Asante kwa kupiga simu DeVote Kenya. Kwaheri.';
+                xml = voiceXml(prompt);
+            }
+
+            else {
+                session.step = 'MAIN_MENU';
+                const prompt = (lang === 'en')
+                    ? 'Invalid choice. Press 1 to vote, 2 to check status, 3 for candidates, 4 for results, or 5 for help.'
+                    : 'Chaguo batili. Bonyeza 1 kupiga kura, 2 kuangalia usajili, 3 wagombea, 4 matokeo, au 5 msaada.';
+                xml = voiceXml(prompt, { numDigits: 1, timeout: 10 });
+            }
+        }
+
+        // ── VOTE FLOW: Enter PIN ─────────────────────────
+        else if (session.step === 'VOTE_ENTER_ID') {
+            const nationalId = (dtmfDigits || '').replace('#', '').trim();
+            const voter = await findVoter(nationalId);
+            session.voter = voter;
+            session.nationalId = nationalId;
+            session.step = 'VOTE_ENTER_PIN';
+
+            const prompt = (session.lang === 'en')
+                ? `Hello ${voter.fullName}. Please enter your 4-digit secret PIN, followed by hash.`
+                : `Hujambo ${voter.fullName}. Tafadhali ingiza PIN yako ya siri ya tarakimu nne, kisha bonyeza reli.`;
+            xml = voiceXml(prompt, { numDigits: 4, timeout: 15, finishOnKey: '#' });
+        }
+
+        // ── VOTE FLOW: Verify PIN & Pick Position ────────
+        else if (session.step === 'VOTE_ENTER_PIN') {
+            const pin = (dtmfDigits || '').replace('#', '').trim();
+            const voter = session.voter;
+            const pinOk = voter.pin ? pin === voter.pin : pin === '1234';
+
+            if (!pinOk) {
+                voiceSessions.delete(sessionId);
+                const prompt = (session.lang === 'en')
+                    ? 'Incorrect PIN entered. For your security, this session is now ended. Goodbye.'
+                    : 'PIN uliyoingiza si sahihi. Kwa usalama wako, simu inakatwa. Kwaheri.';
+                xml = voiceXml(prompt);
+            } else {
+                session.step = 'VOTE_SELECT_POS';
+                const prompt = (session.lang === 'en')
+                    ? 'PIN verified. Select position. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for MP, 6 for MCA.'
+                    : 'PIN imethibitishwa. Chagua nafasi. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.';
+                xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
+            }
+        }
+
+        // ── VOTE FLOW: Pick Candidate ────────────────────
+        else if (session.step === 'VOTE_SELECT_POS') {
+            const posChoice = parseInt(dtmfDigits);
+            if (isNaN(posChoice) || posChoice < 1 || posChoice > 6) {
+                const prompt = (session.lang === 'en')
+                    ? 'Invalid choice. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for MP, 6 for MCA.'
+                    : 'Chaguo batili. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.';
+                xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
+            } else {
+                const posIndex = posChoice - 1;
+                session.posIndex = posIndex;
+                const posName = getPositionName(posIndex, session.lang);
+                session.posName = posName;
+
+                // Check duplicate vote on Sepolia
+                const voterAddr = deriveVoterWallet(session.nationalId).address;
+                let alreadyVoted = false;
+                try {
+                    alreadyVoted = await withTimeout(
+                        votingContract.hasVoterVotedForPosition(voterAddr, posIndex),
+                        5000,
+                        false
+                    );
+                } catch (_) {}
+
+                if (alreadyVoted) {
+                    voiceSessions.delete(sessionId);
+                    const prompt = (session.lang === 'en')
+                        ? `You have already cast your vote for ${posName}. Duplicate voting is strictly prohibited on the blockchain. Thank you and goodbye.`
+                        : `Umeshapiga kura ya nafasi ya ${posName}. Kura mbili hairuhusiwi kwenye blockchain. Asante na kwaheri.`;
+                    xml = voiceXml(prompt);
+                } else {
+                    const candidates = await getCandidatesForPosition(posIndex);
+                    session.candidates = candidates;
+                    session.step = 'VOTE_SELECT_CAND';
+
+                    let candPrompt = (session.lang === 'en')
+                        ? `Candidates for ${posName} are: `
+                        : `Wagombea wa ${posName} ni: `;
+
+                    candidates.forEach((c, i) => {
+                        candPrompt += (session.lang === 'en')
+                            ? `Press ${i + 1} for ${c.name}. `
+                            : `Bonyeza ${i + 1} kumchagua ${c.name}. `;
+                    });
+
+                    xml = voiceXml(candPrompt, { numDigits: 1, timeout: 15 });
+                }
+            }
+        }
+
+        // ── VOTE FLOW: Confirmation ─────────────────────
+        else if (session.step === 'VOTE_SELECT_CAND') {
+            const candChoice = parseInt(dtmfDigits) - 1;
+            const candidates = session.candidates || [];
+            const selected = candidates[candChoice];
+
+            if (!selected) {
+                const prompt = (session.lang === 'en')
+                    ? 'Invalid candidate selection. Please press the digit corresponding to your candidate.'
+                    : 'Chaguo batili. Tafadhali bonyeza nambari ya mgombea unayemtaka.';
+                xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
+            } else {
+                session.selectedCandidate = selected;
+                session.step = 'VOTE_CONFIRM';
+
+                const prompt = (session.lang === 'en')
+                    ? `You have selected ${selected.name} for ${session.posName}. Press 1 to confirm and broadcast your vote to the blockchain. Press 2 to cancel.`
+                    : `Umemchagua ${selected.name} kwa nafasi ya ${session.posName}. Bonyeza 1 kuthibitisha na kurekodi kura yako kwenye blockchain. Bonyeza 2 kughairi.`;
+                xml = voiceXml(prompt, { numDigits: 1, timeout: 12 });
+            }
+        }
+
+        // ── VOTE FLOW: Execute Vote ─────────────────────
+        else if (session.step === 'VOTE_CONFIRM') {
+            if (dtmfDigits === '1') {
+                const voter = session.voter;
+                const nationalId = session.nationalId;
+                const candidate = session.selectedCandidate;
+                const posName = session.posName;
+                const phone = callerNumber || session.callerNumber || '+254712345678';
+                const lang = session.lang;
+
+                voiceSessions.delete(sessionId);
+                const prompt = (lang === 'en')
+                    ? `Thank you! Your vote for ${candidate.name} has been received and is being permanently recorded on the Sepolia Blockchain. An SMS receipt with your transaction hash is being sent to your phone. Thank you for using DeVote Kenya. Goodbye.`
+                    : `Asante! Kura yako kwa ${candidate.name} imepokewa na inarekodiwa kwenye Sepolia Blockchain. SMS ya uthibitisho inatumwa kwa simu yako sasa hivi. Asante kwa kutumia DeVote Kenya. Kwaheri.`;
+                xml = voiceXml(prompt);
+
+                // Async blockchain settlement + SMS
+                processVoteSettlement({
+                    voter,
+                    nationalId,
+                    candidate,
+                    positionName: posName,
+                    phoneNumber: phone,
+                    lang
+                });
+            } else {
+                voiceSessions.delete(sessionId);
+                const prompt = (session.lang === 'en')
+                    ? 'Your vote was cancelled. No ballot was cast. Thank you for calling DeVote Kenya. Goodbye.'
+                    : 'Kura yako imefutiliwa mbali. Hakuna mabadiliko yaliyofanyika. Asante kwa kupiga simu DeVote Kenya. Kwaheri.';
+                xml = voiceXml(prompt);
+            }
+        }
+
+        // ── STATUS FLOW ─────────────────────────────────
+        else if (session.step === 'STATUS_ENTER_ID') {
+            const nationalId = (dtmfDigits || '').replace('#', '').trim();
+            const voter = await findVoter(nationalId);
+            const voterWallet = deriveVoterWallet(nationalId);
+
+            let onChain = false;
+            try {
+                onChain = await withTimeout(votingContract.registeredVoters(voterWallet.address), 5000, false);
+            } catch (_) {}
+
+            voiceSessions.delete(sessionId);
+            const statusLabel = onChain ? 'registered and active on blockchain' : 'registered in voter database';
+            const prompt = (session.lang === 'en')
+                ? `Hello ${voter.fullName}. Your National ID is ${nationalId}. Your status is: ${statusLabel}. You are assigned to ${voter.county} county, ${voter.constituency} constituency. Thank you for calling DeVote Kenya. Goodbye.`
+                : `Hujambo ${voter.fullName}. Kitambulisho chako ni ${nationalId}. Hali yako ni: umeidhinishwa na uko tayari kupiga kura kaunti ya ${voter.county}, eneo bunge la ${voter.constituency}. Asante kwa kupiga simu DeVote Kenya. Kwaheri.`;
+            xml = voiceXml(prompt);
+        }
+
+        // ── CANDIDATE LIST FLOW ─────────────────────────
+        else if (session.step === 'CAND_SELECT_POS') {
+            const posChoice = parseInt(dtmfDigits);
+            if (isNaN(posChoice) || posChoice < 1 || posChoice > 6) {
+                const prompt = (session.lang === 'en')
+                    ? 'Invalid choice. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for MP, 6 for MCA.'
+                    : 'Chaguo batili. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.';
+                xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
+            } else {
+                voiceSessions.delete(sessionId);
+                const posIndex = posChoice - 1;
+                const posName = getPositionName(posIndex, session.lang);
+                const candidates = await getCandidatesForPosition(posIndex);
+
+                let listPrompt = (session.lang === 'en')
+                    ? `The candidates for ${posName} are: `
+                    : `Wagombea wa nafasi ya ${posName} ni: `;
+
+                candidates.forEach((c, i) => {
+                    listPrompt += `${i + 1}, ${c.name}. `;
+                });
+                listPrompt += (session.lang === 'en')
+                    ? 'To cast your vote, please call back and press 1. Goodbye.'
+                    : 'Kupiga kura yako, tafadhali piga simu tena na ubonyeze 1. Kwaheri.';
+                xml = voiceXml(listPrompt);
+            }
+        }
+
+        // ── RESULTS FLOW: Step 1 (ID for Area) ──────────
+        else if (session.step === 'RESULTS_ENTER_ID') {
+            const nationalId = (dtmfDigits || '').replace('#', '').trim();
+            const voter = await findVoter(nationalId);
+            session.voter = voter;
+            session.nationalId = nationalId;
+            session.step = 'RESULTS_SELECT_POS';
+
+            const prompt = (session.lang === 'en')
+                ? `Voter area identified as ${voter.county} county. Select position for results. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for MP, 6 for MCA.`
+                : `Eneo lako limetambuliwa kama kaunti ya ${voter.county}. Chagua nafasi ya matokeo. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.`;
+            xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
+        }
+
+        // ── RESULTS FLOW: Step 2 (Speak Results) ────────
+        else if (session.step === 'RESULTS_SELECT_POS') {
+            const posChoice = parseInt(dtmfDigits);
+            if (isNaN(posChoice) || posChoice < 1 || posChoice > 6) {
+                const prompt = (session.lang === 'en')
+                    ? 'Invalid selection. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for MP, 6 for MCA.'
+                    : 'Chaguo batili. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.';
+                xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
+            } else {
+                voiceSessions.delete(sessionId);
+                const posIndex = posChoice - 1;
+                const posName = getPositionName(posIndex, session.lang);
+                const voter = session.voter;
+                const voterCounty = (voter.county || '').toString().trim();
+                const voterConstituency = (voter.constituency || '').toString().trim();
+                const voterWard = (voter.ward || '').toString().trim();
+
+                if (Date.now() - cacheLastUpdated > CACHE_TTL_MS) {
+                    await refreshCandidateCache();
+                }
+
+                let filtered = candidateCache.filter(c => c.position === posIndex);
+                if (posIndex === 0) {
+                    // President is national
+                } else if (posIndex >= 1 && posIndex <= 3) {
+                    filtered = filtered.filter(c => c.county.toLowerCase() === voterCounty.toLowerCase());
+                } else if (posIndex === 4) {
+                    filtered = filtered.filter(c => c.constituency.toLowerCase() === voterConstituency.toLowerCase());
+                } else if (posIndex === 5) {
+                    filtered = filtered.filter(c => c.ward.toLowerCase() === voterWard.toLowerCase());
+                }
+
+                filtered.sort((a, b) => (b.voteCount || 0) - (a.voteCount || 0));
+
+                let resPrompt = '';
+                if (filtered.length === 0) {
+                    resPrompt = (session.lang === 'en')
+                        ? `No results currently found for ${posName} in your area. For full live updates, visit our portal at blockchainvotingsystem026.netlify.app. Goodbye.`
+                        : `Hakuna matokeo kwa sasa kwa nafasi ya ${posName} katika eneo lako. Tazama tovuti ya blockchainvotingsystem026.netlify.app. Kwaheri.`;
+                } else {
+                    resPrompt = (session.lang === 'en')
+                        ? `Live election results for ${posName}: `
+                        : `Matokeo ya moja kwa moja ya ${posName}: `;
+                    filtered.forEach(c => {
+                        resPrompt += (session.lang === 'en')
+                            ? `${c.name} has ${c.voteCount || 0} votes. `
+                            : `${c.name} ana kura ${c.voteCount || 0}. `;
+                    });
+                    resPrompt += (session.lang === 'en')
+                        ? 'Thank you for calling DeVote Kenya. Goodbye.'
+                        : 'Asante kwa kupiga simu DeVote Kenya. Kwaheri.';
+                }
+                xml = voiceXml(resPrompt);
+            }
+        }
+
+        else {
+            voiceSessions.delete(sessionId);
+            xml = voiceXml('Thank you for calling DeVote Kenya. Goodbye.');
+        }
+
+    } catch (err) {
+        console.error('[Voice Error]:', err);
+        voiceSessions.delete(sessionId);
+        xml = voiceXml('A technical error occurred. Please try again later. Goodbye.');
+    }
+
+    res.set('Content-Type', 'text/xml');
+    res.send(xml);
+}
+
+app.post('/voice', handleVoiceRequest);
+app.get('/voice', (_req, res) => {
+    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>DeVote Kenya Voice IVR Gateway is Active.</Say></Response>`);
+});
+
+// ─────────────────────────────────────────────────────────────
 // ON-CHAIN SETTLEMENT
 // ─────────────────────────────────────────────────────────────
 async function processVoteSettlement({ voter, nationalId, candidate, positionName, phoneNumber, lang = 'en' }) {
