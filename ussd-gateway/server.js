@@ -415,19 +415,43 @@ function deriveVoterWallet(nationalId) {
 }
 
 async function findVoter(nationalId) {
-    const cleanId = nationalId.trim();
+    const cleanId = String(nationalId || '').trim();
     try {
-        const snapshot = await withTimeout(getDocs(collection(db, 'voterRegistrationRequests')), 5000, null);
-        if (snapshot) {
-            for (const docSnap of snapshot.docs) {
+        // 1. Check voters collection first
+        const votersSnap = await withTimeout(getDocs(collection(db, 'voters')), 4000, null);
+        if (votersSnap) {
+            for (const docSnap of votersSnap.docs) {
                 const d = docSnap.data();
-                if (d.idNumber === cleanId && d.status === 'approved') {
+                if (String(d.idNumber || '').trim() === cleanId && String(d.status || '').toLowerCase() === 'approved') {
                     const resolvedCounty = resolveCountyName(d.county, d.constituency);
                     return {
                         id:            docSnap.id,
                         ...d,
+                        isApproved:    true,
                         fullName:      d.fullName,
-                        pin:           d.pin,
+                        pin:           String(d.pin || '').trim(),
+                        county:        resolvedCounty,
+                        constituency:  d.constituency || '',
+                        ward:          d.ward || '',
+                        walletAddress: d.walletAddress || deriveVoterWallet(cleanId).address
+                    };
+                }
+            }
+        }
+
+        // 2. Check voterRegistrationRequests collection
+        const snapshot = await withTimeout(getDocs(collection(db, 'voterRegistrationRequests')), 4000, null);
+        if (snapshot) {
+            for (const docSnap of snapshot.docs) {
+                const d = docSnap.data();
+                if (String(d.idNumber || '').trim() === cleanId && String(d.status || '').toLowerCase() === 'approved') {
+                    const resolvedCounty = resolveCountyName(d.county, d.constituency);
+                    return {
+                        id:            docSnap.id,
+                        ...d,
+                        isApproved:    true,
+                        fullName:      d.fullName,
+                        pin:           String(d.pin || '').trim(),
                         county:        resolvedCounty,
                         constituency:  d.constituency || '',
                         ward:          d.ward || '',
@@ -437,18 +461,19 @@ async function findVoter(nationalId) {
             }
         }
     } catch (e) {
-        console.warn('[Firestore]', e.message);
+        console.warn('[Firestore findVoter]', e.message);
     }
 
-    // Test fallback – accepted with PIN 1234
+    // Fallback if not registered
     return {
-        fullName:     'Mwananchi (Test)',
+        fullName:     'Mwananchi (Unregistered)',
         idNumber:     cleanId,
         pin:          '1234',
         county:       'Nairobi',
         constituency: 'Embakasi East',
         ward:         'Pipeline',
-        walletAddress: deriveVoterWallet(cleanId).address
+        walletAddress: deriveVoterWallet(cleanId).address,
+        isApproved:   false
     };
 }
 
@@ -613,14 +638,15 @@ Select Language / Chagua Lugha:
                 } else {
                     const nationalId  = subInputs[1].trim();
                     const voter       = await findVoter(nationalId);
-                    const voterWallet = deriveVoterWallet(nationalId);
+                    const walletAddr  = voter.walletAddress || deriveVoterWallet(nationalId).address;
                     let onChain = false;
                     try {
-                        onChain = await withTimeout(votingContract.registeredVoters(voterWallet.address), 6000, false);
+                        onChain = await withTimeout(votingContract.registeredVoters(walletAddr), 3000, false);
                     } catch (_) {}
 
+                    const isRegistered = voter.isApproved || onChain;
                     const voterName = voter.fullName || (lang === 'en' ? 'Unknown' : 'Haijulikani');
-                    response = t.voterStatus(voterName, nationalId, voterWallet.address, onChain);
+                    response = t.voterStatus(voterName, nationalId, walletAddr, isRegistered);
                 }
             }
 
@@ -1023,18 +1049,22 @@ async function handleVoiceRequest(req, res) {
         else if (session.step === 'STATUS_ENTER_ID') {
             const nationalId = (dtmfDigits || '').replace('#', '').trim();
             const voter = await findVoter(nationalId);
-            const voterWallet = deriveVoterWallet(nationalId);
+            const walletAddr = voter.walletAddress || deriveVoterWallet(nationalId).address;
 
             let onChain = false;
             try {
-                onChain = await withTimeout(votingContract.registeredVoters(voterWallet.address), 5000, false);
+                onChain = await withTimeout(votingContract.registeredVoters(walletAddr), 3000, false);
             } catch (_) {}
 
             voiceSessions.delete(sessionId);
-            const statusLabel = onChain ? 'registered and active on blockchain' : 'registered in voter database';
+            const isRegistered = voter.isApproved || onChain;
+            const statusLabel = isRegistered
+                ? (onChain ? 'registered and verified on blockchain' : 'registered and approved in voter database')
+                : 'not registered';
+
             const prompt = (session.lang === 'en')
                 ? `Hello ${voter.fullName}. Your National ID is ${nationalId}. Your status is: ${statusLabel}. You are assigned to ${voter.county} county, ${voter.constituency} constituency. Thank you for calling DeVote Kenya. Goodbye.`
-                : `Hujambo ${voter.fullName}. Kitambulisho chako ni ${nationalId}. Hali yako ni: umeidhinishwa na uko tayari kupiga kura kaunti ya ${voter.county}, eneo bunge la ${voter.constituency}. Asante kwa kupiga simu DeVote Kenya. Kwaheri.`;
+                : `Hujambo ${voter.fullName}. Kitambulisho chako ni ${nationalId}. Hali yako ni: ${isRegistered ? 'umeidhinishwa na uko tayari kupiga kura' : 'haujasajiliwa'} kaunti ya ${voter.county}, eneo bunge la ${voter.constituency}. Asante kwa kupiga simu DeVote Kenya. Kwaheri.`;
             xml = voiceXml(prompt);
         }
 
