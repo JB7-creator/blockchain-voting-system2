@@ -488,8 +488,16 @@ const AdminPanel = ({
     }
   };
 
-  // Check if user is main contract admin
-  const isMainAdmin = isAdmin && account && adminAddress && account.toLowerCase() === adminAddress.toLowerCase();
+  // Check if user is main contract admin or authorized secondary admin
+  const AUTHORIZED_ADMINS = [
+    "0x54feb9d84960bfb2cf7e52ac5c0106f93a28012b",
+    "0x9dbeb02aa68e620304ad3b21f832434ea2e3bfc0",
+  ];
+  const isMainAdmin =
+    isAdmin &&
+    account &&
+    ((adminAddress && account.toLowerCase() === adminAddress.toLowerCase()) ||
+      AUTHORIZED_ADMINS.includes(account.toLowerCase()));
 
   // Show warning for non-main-admin users
   const showAdminWarning = isAdmin && !isMainAdmin;
