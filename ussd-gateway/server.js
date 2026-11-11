@@ -17,7 +17,7 @@ const { ethers } = require('ethers');
 const africastalking = require('africastalking');
 const bcrypt = require('bcryptjs');
 
-const { db, collection, getDocs } = require('./firebase');
+const { db, collection, getDocs, doc, setDoc, updateDoc } = require('./firebase');
 const votingAbi = require('./contractAbi');
 
 const app = express();
@@ -478,6 +478,88 @@ async function findVoter(nationalId) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// VOTING SECURITY & SUMMARY HELPERS
+// ─────────────────────────────────────────────────────────────
+const POS_FIELD_MAP = [
+    { flag: 'hasVotedPresident', cand: 'votedPresident', tx: 'votedPresidentTx', name: 'President' },
+    { flag: 'hasVotedGovernor', cand: 'votedGovernor', tx: 'votedGovernorTx', name: 'Governor' },
+    { flag: 'hasVotedSenator', cand: 'votedSenator', tx: 'votedSenatorTx', name: 'Senator' },
+    { flag: 'hasVotedWomanRepresentative', cand: 'votedWomanRepresentative', tx: 'votedWomanRepresentativeTx', name: 'Woman Rep' },
+    { flag: 'hasVotedMP', cand: 'votedMP', tx: 'votedMPTx', name: 'MP' },
+    { flag: 'hasVotedMCA', cand: 'votedMCA', tx: 'votedMCATx', name: 'MCA' },
+];
+
+async function recordVoteInFirestore(voter, nationalId, posIndex, candidate, txHash) {
+    const cleanId = String(nationalId || '').trim();
+    const mapping = POS_FIELD_MAP[posIndex];
+    if (!mapping) return;
+
+    const updates = {
+        [mapping.flag]: true,
+        [mapping.cand]: candidate.name,
+        [mapping.tx]: txHash || '',
+        lastVotedAt: new Date().toISOString()
+    };
+
+    try {
+        const walletAddr = (voter.walletAddress || deriveVoterWallet(cleanId).address).toLowerCase();
+        // 1. Update voters collection
+        await setDoc(doc(db, 'voters', walletAddr), updates, { merge: true });
+
+        // 2. Also update by idNumber fallback doc
+        await setDoc(doc(db, 'voters', `id_${cleanId}`), updates, { merge: true });
+
+        // 3. Update registration request if id is known
+        if (voter.id) {
+            await setDoc(doc(db, 'voterRegistrationRequests', voter.id), updates, { merge: true });
+        }
+        console.log(`[Firestore Security] Vote permanently recorded: ID=${cleanId} Position=${mapping.name} Candidate=${candidate.name}`);
+    } catch (err) {
+        console.warn('[Firestore Vote Save Notice]:', err.message);
+    }
+}
+
+async function getVoterVotingSummary(voter, nationalId) {
+    const cleanId = String(nationalId || '').trim();
+    const walletAddr = voter.walletAddress || deriveVoterWallet(cleanId).address;
+    const summary = {
+        hasVoted: [false, false, false, false, false, false],
+        candidates: ['', '', '', '', '', ''],
+        totalVoted: 0,
+        allCompleted: false
+    };
+
+    // Check voter object fields first
+    POS_FIELD_MAP.forEach((map, idx) => {
+        if (voter[map.flag] === true) {
+            summary.hasVoted[idx] = true;
+            summary.candidates[idx] = voter[map.cand] || 'Recorded';
+        }
+    });
+
+    // Check on-chain contract for any positions not flagged in Firestore
+    for (let i = 0; i < 6; i++) {
+        if (!summary.hasVoted[i] && votingContract && walletAddr) {
+            try {
+                const onChainVoted = await withTimeout(
+                    votingContract.hasVoterVotedForPosition(walletAddr, i),
+                    1200,
+                    false
+                );
+                if (onChainVoted) {
+                    summary.hasVoted[i] = true;
+                    if (!summary.candidates[i]) summary.candidates[i] = 'Blockchain Verified ✓';
+                }
+            } catch (_) {}
+        }
+    }
+
+    summary.totalVoted = summary.hasVoted.filter(Boolean).length;
+    summary.allCompleted = summary.totalVoted === 6;
+    return summary;
+}
+
+// ─────────────────────────────────────────────────────────────
 // USSD ROUTE (Handles both /ussd and / POST)
 // ─────────────────────────────────────────────────────────────
 async function handleUssdRequest(req, res) {
@@ -527,7 +609,7 @@ Select Language / Chagua Lugha:
                     response = t.enterPin(voter.fullName);
                 }
 
-                // 1*1*{id}*{pin} → Verify PIN, show positions
+                // 1*1*{id}*{pin} → Verify PIN, check double voting security, show positions
                 else if (subInputs.length === 3) {
                     const voter = await findVoter(subInputs[1]);
                     const pinOk = voter.pin ? subInputs[2] === voter.pin : subInputs[2] === '1234';
@@ -535,7 +617,21 @@ Select Language / Chagua Lugha:
                     if (!pinOk) {
                         response = t.wrongPin;
                     } else {
-                        response = t.selectPosition;
+                        const summary = await getVoterVotingSummary(voter, subInputs[1]);
+                        if (summary.allCompleted) {
+                            response = (lang === 'en')
+                                ? `END ⚠️ Duplicate Voting Prohibited!\n━━━━━━━━━━━━━━━━━━━━\nYou have already cast all 6 ballots:\n• President: ${summary.candidates[0] || 'Voted ✓'}\n• Governor : ${summary.candidates[1] || 'Voted ✓'}\n• Senator  : ${summary.candidates[2] || 'Voted ✓'}\n• Woman Rep: ${summary.candidates[3] || 'Voted ✓'}\n• MP       : ${summary.candidates[4] || 'Voted ✓'}\n• MCA      : ${summary.candidates[5] || 'Voted ✓'}\n━━━━━━━━━━━━━━━━━━━━\nIEBC & Blockchain Security Active`
+                                : `END ⚠️ Marufuku Kupiga Kura Mara Mbili!\n━━━━━━━━━━━━━━━━━━━━\nTayari umeshapiga kura zote 6:\n• Rais     : ${summary.candidates[0] || 'Imepigwa ✓'}\n• Gavana   : ${summary.candidates[1] || 'Imepigwa ✓'}\n• Seneta   : ${summary.candidates[2] || 'Imepigwa ✓'}\n• Woman Rep: ${summary.candidates[3] || 'Imepigwa ✓'}\n• Mbunge   : ${summary.candidates[4] || 'Imepigwa ✓'}\n• Diwani   : ${summary.candidates[5] || 'Imepigwa ✓'}\n━━━━━━━━━━━━━━━━━━━━\nUlinzi wa IEBC & Blockchain Unafanya Kazi`;
+                        } else {
+                            let menu = (lang === 'en') ? `CON Select Election Position:\n` : `CON Chagua Nafasi ya Uchaguzi:\n`;
+                            const posLabels = (lang === 'en') ? POSITIONS_EN : POSITIONS_SW;
+                            posLabels.forEach((name, i) => {
+                                const statusTag = summary.hasVoted[i] ? ` [Voted ✓]` : ``;
+                                menu += `${i + 1}. ${name}${statusTag}\n`;
+                            });
+                            menu += `0. ${lang === 'en' ? 'Back' : 'Rudi'}`;
+                            response = menu;
+                        }
                     }
                 }
 
@@ -548,6 +644,7 @@ Select Language / Chagua Lugha:
                     if (!pinOk) {
                         response = t.wrongPin;
                     } else {
+                        const summary = await getVoterVotingSummary(voter, nationalId);
                         const voteFlow = subInputs.slice(3);
                         // voteFlow[0] is starting position choice (1=President, 2=Governor, etc.)
                         if (voteFlow[0] === '0') {
@@ -558,106 +655,117 @@ Select Language / Chagua Lugha:
                                 response = t.invalidPosition;
                             } else {
                                 const startPos = startPosChoice - 1;
-                                // Sequence of positions starting from the selected one
-                                const POS_SEQUENCE = [0, 1, 2, 3, 4, 5].map((_, idx) => (startPos + idx) % 6);
-                                const actions = voteFlow.slice(1);
 
-                                // Count completed position pairs [candidateChoice, '1']
-                                let currentStep = 0; // 0 to 5
-                                let actionIdx = 0;
-
-                                while (actionIdx + 1 < actions.length && actions[actionIdx + 1] === '1' && currentStep < 5) {
-                                    currentStep++;
-                                    actionIdx += 2;
-                                }
-
-                                const rem = actions.slice(actionIdx);
-
-                                // Check if user chose '0' to exit
-                                if (rem.length > 0 && rem[rem.length - 1] === '0') {
+                                // Security Check: Prevent voting for an already-voted position
+                                if (summary.hasVoted[startPos]) {
+                                    const posName = getPositionName(startPos, lang);
                                     response = (lang === 'en')
-                                        ? `END Asante! Voting session completed.\nAll confirmed ballots have been securely recorded on the blockchain.\nWebsite: ${SITE_URL}`
-                                        : `END Asante! Kikao cha kupiga kura kimekamilika.\nKura zako zote zilizothibitishwa zimerekodiwa kwenye blockchain.\nTovuti: ${SITE_URL}`;
-                                }
-                                // Case 1: Prompt candidate selection for current ballot
-                                else if (rem.length === 0) {
-                                    // Settle previous confirmed ballot if transitioning
-                                    if (currentStep > 0 && actionIdx >= 2) {
-                                        const prevPos = POS_SEQUENCE[currentStep - 1];
-                                        const prevCandChoice = parseInt(actions[actionIdx - 2]) - 1;
-                                        const prevCandidates = await getCandidatesForPosition(prevPos);
-                                        const prevSelected = prevCandidates[prevCandChoice];
-                                        const prevPosName = getPositionName(prevPos, lang);
-                                        if (prevSelected) {
-                                            processVoteSettlement({
-                                                voter, nationalId,
-                                                candidate: prevSelected,
-                                                positionName: prevPosName,
-                                                phoneNumber, lang
-                                            });
-                                        }
+                                        ? `END ⚠️ Already Voted for ${posName}!\n━━━━━━━━━━━━━━━━━━━━\nSelected : ${summary.candidates[startPos] || 'Recorded'}\nDuplicate voting is strictly prohibited under IEBC election law.\nWebsite: ${SITE_URL}`
+                                        : `END ⚠️ Umeshapiga Kura ya ${posName}!\n━━━━━━━━━━━━━━━━━━━━\nUliyemchagua: ${summary.candidates[startPos] || 'Imerekodiwa'}\nKupiga kura mara mbili ni marufuku kisheria.\nTovuti: ${SITE_URL}`;
+                                } else {
+                                    // Sequence of positions starting from the selected one
+                                    const POS_SEQUENCE = [0, 1, 2, 3, 4, 5].map((_, idx) => (startPos + idx) % 6);
+                                    const actions = voteFlow.slice(1);
+
+                                    // Count completed position pairs [candidateChoice, '1']
+                                    let currentStep = 0; // 0 to 5
+                                    let actionIdx = 0;
+
+                                    while (actionIdx + 1 < actions.length && actions[actionIdx + 1] === '1' && currentStep < 5) {
+                                        currentStep++;
+                                        actionIdx += 2;
                                     }
 
-                                    const curPos = POS_SEQUENCE[currentStep];
-                                    const curPosName = getPositionName(curPos, lang);
-                                    const curCandidates = await getCandidatesForPosition(curPos);
-                                    const ballotNum = currentStep + 1;
+                                    const rem = actions.slice(actionIdx);
 
-                                    let header = (currentStep === 0)
-                                        ? ((lang === 'en') ? `CON Ballot ${ballotNum}/6: Select ${curPosName}:\n` : `CON Kura ${ballotNum}/6: Chagua ${curPosName}:\n`)
-                                        : ((lang === 'en') ? `CON ✓ Previous ballot recorded!\n━━━━━━━━━━━━━━━━━━━━\nBallot ${ballotNum}/6: Select ${curPosName}:\n` : `CON ✓ Kura iliyopita imerekodiwa!\n━━━━━━━━━━━━━━━━━━━━\nKura ${ballotNum}/6: Chagua ${curPosName}:\n`);
-
-                                    curCandidates.forEach((c, i) => { header += `${i + 1}. ${c.name}\n`; });
-                                    header += `0. ${lang === 'en' ? 'Exit & Submit' : 'Maliza na Utoke'}`;
-                                    response = header;
-                                }
-                                // Case 2: User picked candidate -> Show confirmation screen
-                                else if (rem.length === 1) {
-                                    const candChoice = parseInt(rem[0]) - 1;
-                                    const curPos = POS_SEQUENCE[currentStep];
-                                    const curPosName = getPositionName(curPos, lang);
-                                    const curCandidates = await getCandidatesForPosition(curPos);
-                                    const selected = curCandidates[candChoice];
-
-                                    if (!selected) {
-                                        response = t.invalidCandidateChoice;
-                                    } else {
+                                    // Check if user chose '0' to exit
+                                    if (rem.length > 0 && rem[rem.length - 1] === '0') {
                                         response = (lang === 'en')
-                                            ? `CON Confirm Ballot (${currentStep + 1}/6):\n━━━━━━━━━━━━━━━━━━━━\nPosition : ${curPosName}\nCandidate: ${selected.name}\n━━━━━━━━━━━━━━━━━━━━\n1. Yes, Confirm Vote\n2. Change Candidate\n0. Exit & Submit`
-                                            : `CON Thibitisha Kura (${currentStep + 1}/6):\n━━━━━━━━━━━━━━━━━━━━\nNafasi  : ${curPosName}\nMgombea: ${selected.name}\n━━━━━━━━━━━━━━━━━━━━\n1. Ndio, Thibitisha\n2. Badilisha Mgombea\n0. Maliza na Utoke`;
+                                            ? `END Asante! Voting session completed.\nAll confirmed ballots have been securely recorded on the blockchain.\nWebsite: ${SITE_URL}`
+                                            : `END Asante! Kikao cha kupiga kura kimekamilika.\nKura zako zote zilizothibitishwa zimerekodiwa kwenye blockchain.\nTovuti: ${SITE_URL}`;
                                     }
-                                }
-                                // Case 3: Confirmation response
-                                else if (rem.length >= 2) {
-                                    const confirmChoice = rem[1];
-                                    if (confirmChoice === '2') {
-                                        // Change candidate -> re-show candidates
-                                        const curPos = POS_SEQUENCE[currentStep];
-                                        const curPosName = getPositionName(curPos, lang);
-                                        const curCandidates = await getCandidatesForPosition(curPos);
-                                        let header = `CON ${currentStep + 1}/6: ${t.candidatesFor(curPosName)}`;
-                                        curCandidates.forEach((c, i) => { header += `${i + 1}. ${c.name}\n`; });
-                                        header += `0. ${lang === 'en' ? 'Exit & Submit' : 'Maliza na Utoke'}`;
-                                        response = header;
-                                    } else if (confirmChoice === '1') {
-                                        // Final 6th position confirmation
-                                        if (currentStep === 5) {
-                                            const curPos = POS_SEQUENCE[5];
-                                            const curPosName = getPositionName(curPos, lang);
-                                            const curCandidates = await getCandidatesForPosition(curPos);
-                                            const selected = curCandidates[parseInt(rem[0]) - 1];
-                                            if (selected) {
+                                    // Case 1: Prompt candidate selection for current ballot
+                                    else if (rem.length === 0) {
+                                        // Settle previous confirmed ballot if transitioning
+                                        if (currentStep > 0 && actionIdx >= 2) {
+                                            const prevPos = POS_SEQUENCE[currentStep - 1];
+                                            const prevCandChoice = parseInt(actions[actionIdx - 2]) - 1;
+                                            const prevCandidates = await getCandidatesForPosition(prevPos);
+                                            const prevSelected = prevCandidates[prevCandChoice];
+                                            const prevPosName = getPositionName(prevPos, lang);
+                                            if (prevSelected) {
                                                 processVoteSettlement({
                                                     voter, nationalId,
-                                                    candidate: selected,
-                                                    positionName: curPosName,
+                                                    candidate: prevSelected,
+                                                    positionName: prevPosName,
+                                                    posIndex: prevPos,
                                                     phoneNumber, lang
                                                 });
                                             }
+                                        }
 
+                                        const curPos = POS_SEQUENCE[currentStep];
+                                        const curPosName = getPositionName(curPos, lang);
+                                        const curCandidates = await getCandidatesForPosition(curPos);
+                                        const ballotNum = currentStep + 1;
+
+                                        let header = (currentStep === 0)
+                                            ? ((lang === 'en') ? `CON Ballot ${ballotNum}/6: Select ${curPosName}:\n` : `CON Kura ${ballotNum}/6: Chagua ${curPosName}:\n`)
+                                            : ((lang === 'en') ? `CON ✓ Previous ballot recorded!\n━━━━━━━━━━━━━━━━━━━━\nBallot ${ballotNum}/6: Select ${curPosName}:\n` : `CON ✓ Kura iliyopita imerekodiwa!\n━━━━━━━━━━━━━━━━━━━━\nKura ${ballotNum}/6: Chagua ${curPosName}:\n`);
+
+                                        curCandidates.forEach((c, i) => { header += `${i + 1}. ${c.name}\n`; });
+                                        header += `0. ${lang === 'en' ? 'Exit & Submit' : 'Maliza na Utoke'}`;
+                                        response = header;
+                                    }
+                                    // Case 2: User picked candidate -> Show confirmation screen
+                                    else if (rem.length === 1) {
+                                        const candChoice = parseInt(rem[0]) - 1;
+                                        const curPos = POS_SEQUENCE[currentStep];
+                                        const curPosName = getPositionName(curPos, lang);
+                                        const curCandidates = await getCandidatesForPosition(curPos);
+                                        const selected = curCandidates[candChoice];
+
+                                        if (!selected) {
+                                            response = t.invalidCandidateChoice;
+                                        } else {
                                             response = (lang === 'en')
-                                                ? `END Asante! All 6 Ballots Cast! ✓\n━━━━━━━━━━━━━━━━━━━━\nAll your votes for:\n- President\n- Governor\n- Senator\n- Woman Rep\n- MP\n- MCA\nhave been secured on the Blockchain.\nSMS receipts sent.\nWebsite: ${SITE_URL}`
-                                                : `END Asante! Kura Zote 6 Zimekamilika! ✓\n━━━━━━━━━━━━━━━━━━━━\nKura zako zote za:\n- Rais\n- Gavana\n- Seneta\n- Woman Rep\n- Mbunge\n- Diwani\nzimerekodiwa kwenye Blockchain.\nRisiti za SMS zimetumwa.\nTovuti: ${SITE_URL}`;
+                                                ? `CON Confirm Ballot (${currentStep + 1}/6):\n━━━━━━━━━━━━━━━━━━━━\nPosition : ${curPosName}\nCandidate: ${selected.name}\n━━━━━━━━━━━━━━━━━━━━\n1. Yes, Confirm Vote\n2. Change Candidate\n0. Exit & Submit`
+                                                : `CON Thibitisha Kura (${currentStep + 1}/6):\n━━━━━━━━━━━━━━━━━━━━\nNafasi  : ${curPosName}\nMgombea: ${selected.name}\n━━━━━━━━━━━━━━━━━━━━\n1. Ndio, Thibitisha\n2. Badilisha Mgombea\n0. Maliza na Utoke`;
+                                        }
+                                    }
+                                    // Case 3: Confirmation response
+                                    else if (rem.length >= 2) {
+                                        const confirmChoice = rem[1];
+                                        if (confirmChoice === '2') {
+                                            // Change candidate -> re-show candidates
+                                            const curPos = POS_SEQUENCE[currentStep];
+                                            const curPosName = getPositionName(curPos, lang);
+                                            const curCandidates = await getCandidatesForPosition(curPos);
+                                            let header = `CON ${currentStep + 1}/6: ${t.candidatesFor(curPosName)}`;
+                                            curCandidates.forEach((c, i) => { header += `${i + 1}. ${c.name}\n`; });
+                                            header += `0. ${lang === 'en' ? 'Exit & Submit' : 'Maliza na Utoke'}`;
+                                            response = header;
+                                        } else if (confirmChoice === '1') {
+                                            // Final 6th position confirmation
+                                            if (currentStep === 5) {
+                                                const curPos = POS_SEQUENCE[5];
+                                                const curPosName = getPositionName(curPos, lang);
+                                                const curCandidates = await getCandidatesForPosition(curPos);
+                                                const selected = curCandidates[parseInt(rem[0]) - 1];
+                                                if (selected) {
+                                                    processVoteSettlement({
+                                                        voter, nationalId,
+                                                        candidate: selected,
+                                                        positionName: curPosName,
+                                                        posIndex: curPos,
+                                                        phoneNumber, lang
+                                                    });
+                                                }
+
+                                                response = (lang === 'en')
+                                                    ? `END Asante! All 6 Ballots Cast! ✓\n━━━━━━━━━━━━━━━━━━━━\nAll your votes for:\n- President\n- Governor\n- Senator\n- Woman Rep\n- MP\n- MCA\nhave been secured on the Blockchain.\nSMS receipts sent.\nWebsite: ${SITE_URL}`
+                                                    : `END Asante! Kura Zote 6 Zimekamilika! ✓\n━━━━━━━━━━━━━━━━━━━━\nKura zako zote za:\n- Rais\n- Gavana\n- Seneta\n- Woman Rep\n- Mbunge\n- Diwani\nzimerekodiwa kwenye Blockchain.\nRisiti za SMS zimetumwa.\nTovuti: ${SITE_URL}`;
+                                            }
                                         }
                                     }
                                 }
@@ -667,7 +775,7 @@ Select Language / Chagua Lugha:
                 }
             }
 
-            // ── Branch 2: CHECK REGISTRATION STATUS ────────
+            // ── Branch 2: CHECK REGISTRATION STATUS & SUMMARY ──
             else if (subInputs[0] === '2') {
                 if (subInputs.length === 1) {
                     response = t.enterIdStatus;
@@ -684,7 +792,41 @@ Select Language / Chagua Lugha:
 
                     const isRegistered = voter.isApproved || onChain;
                     const voterName = voter.fullName || (lang === 'en' ? 'Unknown' : 'Haijulikani');
-                    response = t.voterStatus(voterName, nationalId, walletAddr, isRegistered);
+                    const summary = await getVoterVotingSummary(voter, nationalId);
+
+                    response = (lang === 'en')
+                        ? `END Voter Profile & Voting Summary:
+━━━━━━━━━━━━━━━━━━━━
+Name   : ${voterName}
+ID     : ${nationalId}
+Area   : ${voter.county || 'N/A'} • ${voter.constituency || 'N/A'}
+Status : ${isRegistered ? 'Registered ✓' : 'Not Registered'}
+━━━━━━━━━━━━━━━━━━━━
+Ballots (${summary.totalVoted}/6 Cast):
+• President: ${summary.hasVoted[0] ? (summary.candidates[0] || 'Voted ✓') : 'Not Cast'}
+• Governor : ${summary.hasVoted[1] ? (summary.candidates[1] || 'Voted ✓') : 'Not Cast'}
+• Senator  : ${summary.hasVoted[2] ? (summary.candidates[2] || 'Voted ✓') : 'Not Cast'}
+• Woman Rep: ${summary.hasVoted[3] ? (summary.candidates[3] || 'Voted ✓') : 'Not Cast'}
+• MP       : ${summary.hasVoted[4] ? (summary.candidates[4] || 'Voted ✓') : 'Not Cast'}
+• MCA      : ${summary.hasVoted[5] ? (summary.candidates[5] || 'Voted ✓') : 'Not Cast'}
+━━━━━━━━━━━━━━━━━━━━
+Verified on Sepolia Blockchain`
+                        : `END Taarifa na Muhtasari wa Kura:
+━━━━━━━━━━━━━━━━━━━━
+Jina   : ${voterName}
+ID     : ${nationalId}
+Eneo   : ${voter.county || 'N/A'} • ${voter.constituency || 'N/A'}
+Usajili: ${isRegistered ? 'Umesajiliwa ✓' : 'Haijasajiliwa'}
+━━━━━━━━━━━━━━━━━━━━
+Kura (${summary.totalVoted}/6 Zilizopigwa):
+• Rais     : ${summary.hasVoted[0] ? (summary.candidates[0] || 'Imepigwa ✓') : 'Bado'}
+• Gavana   : ${summary.hasVoted[1] ? (summary.candidates[1] || 'Imepigwa ✓') : 'Bado'}
+• Seneta   : ${summary.hasVoted[2] ? (summary.candidates[2] || 'Imepigwa ✓') : 'Bado'}
+• Woman Rep: ${summary.hasVoted[3] ? (summary.candidates[3] || 'Imepigwa ✓') : 'Bado'}
+• Mbunge   : ${summary.hasVoted[4] ? (summary.candidates[4] || 'Imepigwa ✓') : 'Bado'}
+• Diwani   : ${summary.hasVoted[5] ? (summary.candidates[5] || 'Imepigwa ✓') : 'Bado'}
+━━━━━━━━━━━━━━━━━━━━
+Imethibitishwa kwenye Blockchain`;
                 }
             }
 
@@ -1250,7 +1392,7 @@ app.get('/voice', (_req, res) => {
 // ─────────────────────────────────────────────────────────────
 // ON-CHAIN SETTLEMENT
 // ─────────────────────────────────────────────────────────────
-async function processVoteSettlement({ voter, nationalId, candidate, positionName, phoneNumber, lang = 'en' }) {
+async function processVoteSettlement({ voter, nationalId, candidate, positionName, posIndex = 0, phoneNumber, lang = 'en' }) {
     console.log(`[Settlement] ID=${nationalId} → Candidate #${candidate.id} (${candidate.name}) [${lang}]`);
     const voterWallet = deriveVoterWallet(nationalId);
 
@@ -1258,6 +1400,7 @@ async function processVoteSettlement({ voter, nationalId, candidate, positionNam
         if (!relayerWallet) {
             const fakeTxHash = ethers.hexlify(ethers.randomBytes(32));
             console.log(`[Simulation] Fake TxHash: ${fakeTxHash}`);
+            await recordVoteInFirestore(voter, nationalId, posIndex, candidate, fakeTxHash);
             await sendSms(phoneNumber, candidate.name, positionName, fakeTxHash, lang);
             return;
         }
@@ -1289,6 +1432,7 @@ async function processVoteSettlement({ voter, nationalId, candidate, positionNam
         const receipt = await voteTx.wait(1);
         console.log(`[Confirmed] Block #${receipt.blockNumber} Hash: ${receipt.hash}`);
 
+        await recordVoteInFirestore(voter, nationalId, posIndex, candidate, receipt.hash);
         await sendSms(phoneNumber, candidate.name, positionName, receipt.hash, lang);
 
     } catch (err) {
@@ -1296,6 +1440,7 @@ async function processVoteSettlement({ voter, nationalId, candidate, positionNam
         // Deterministic cryptographic receipt fallback
         const receiptHash = ethers.keccak256(ethers.toUtf8Bytes(`${nationalId}:${candidate.id}:${Date.now()}`));
         console.log(`[Receipt Generated] Hash: ${receiptHash}`);
+        await recordVoteInFirestore(voter, nationalId, posIndex, candidate, receiptHash);
         await sendSms(phoneNumber, candidate.name, positionName, receiptHash, lang);
     }
 }

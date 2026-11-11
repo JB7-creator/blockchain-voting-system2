@@ -13,6 +13,7 @@ const {
   addDoc, 
   doc, 
   updateDoc, 
+  setDoc,
   serverTimestamp 
 } = require("firebase/firestore");
 
@@ -37,5 +38,6 @@ module.exports = {
   addDoc,
   doc,
   updateDoc,
+  setDoc,
   serverTimestamp
 };
