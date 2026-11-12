@@ -5,6 +5,8 @@ const Navbar = ({ onConnectWallet, isConnected, account, onNavigate }) => {
   const [activeLink, setActiveLink] = useState('Home');
 
   const navLinks = ['Home', 'About', 'How It Works', 'Registration', 'Vote', 'Results'];
+  // Sauti Learn is opt-out via env (shown by default). See src/sauti/.
+  if (process.env.REACT_APP_SAUTI_ENABLED !== 'false') navLinks.splice(3, 0, 'Sauti Learn');
 
   const toggleMobileMenu = () => {
     setIsMobileMenuOpen(!isMobileMenuOpen);
@@ -41,6 +43,13 @@ const Navbar = ({ onConnectWallet, isConnected, account, onNavigate }) => {
         onNavigate('registration');
       } else {
         window.location.hash = 'registration';
+      }
+    } else if (link === 'Sauti Learn') {
+      // Navigate to Sauti Learn (voice teacher) page
+      if (onNavigate) {
+        onNavigate('sauti');
+      } else {
+        window.location.hash = 'sauti';
       }
     } else if (link === 'Vote') {
       // Navigate to Vote page
@@ -82,6 +91,8 @@ const Navbar = ({ onConnectWallet, isConnected, account, onNavigate }) => {
         setActiveLink('How It Works');
       } else if (hash === 'registration') {
         setActiveLink('Registration');
+      } else if (hash === 'sauti') {
+        setActiveLink('Sauti Learn');
       } else if (hash === 'vote') {
         setActiveLink('Vote');
       } else if (hash === 'results') {

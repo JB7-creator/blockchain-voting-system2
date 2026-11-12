@@ -14,7 +14,10 @@
     "ui:start": "cd devote-ui && npm start",
     "ui:build": "cd devote-ui && npm run build",
     "ui:test": "cd devote-ui && npm test",
-    "install:all": "npm install && npm run ui:install"
+    "install:all": "npm install && npm run ui:install",
+    "sauti:install": "cd sauti-learn-service && npm install",
+    "sauti:start": "cd sauti-learn-service && npm start",
+    "sauti:test": "cd sauti-learn-service && npm test"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-ethers": "^3.0.6",

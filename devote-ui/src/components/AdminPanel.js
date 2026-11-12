@@ -7,6 +7,7 @@ import { kenyaLocations } from "../data/kenyaLocations";
 import { getPositionIndex } from "../utils/electionFilters";
 import BulkVoterUpload from "./BulkVoterUpload";
 import VoterRegistrationRequests from "./VoterRegistrationRequests";
+import LiveVotesAudit from "./LiveVotesAudit";
 
 const POSITIONS = [
   { value: "", label: "Select Position" },
@@ -941,6 +942,9 @@ const AdminPanel = ({
           )}
         </div>
       )}
+
+      {/* Live Votes Audit Section */}
+      <LiveVotesAudit />
 
       {/* Voter Registration Requests Section */}
       <div className="mt-8">

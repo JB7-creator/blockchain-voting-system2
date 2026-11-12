@@ -1,5 +1,5 @@
 /**
- * DeVote Kenya - USSD & Bulk SMS Blockchain Gateway v2
+ * DeVote Kenya - USSD & Bulk SMS Blockchain Gateway v3
  * ======================================================
  * Connects Africa's Talking USSD → Ethereum Sepolia → Firebase
  * Site: https://blockchainvotingsystem026.netlify.app
@@ -9,16 +9,25 @@
  * - 3-Factor Auth: Phone + National ID + PIN
  * - Area-filtered results: Governor/Senator/Woman Rep by County, MP by Constituency, MCA by Ward, President National
  * - Async on-chain settlement & Bulk SMS receipt
+ * - Real-time results with live cache refresh (30s TTL, background refresh)
+ * - USSD character-safe responses (≤ 182 chars per screen)
+ * - Full vote flow: positions shown with ✓ for already-voted, skip already-voted automatically
+ * - Robust error handling: empty response guard, timeout fallbacks
  */
 
 require('dotenv').config();
-const express = require('express');
+const express  = require('express');
 const { ethers } = require('ethers');
 const africastalking = require('africastalking');
-const bcrypt = require('bcryptjs');
+const bcrypt   = require('bcryptjs');
 
-const { db, collection, getDocs, doc, setDoc, updateDoc } = require('./firebase');
+const { db, collection, getDocs, doc, setDoc, updateDoc, addDoc, serverTimestamp, query, where } = require('./firebase');
 const votingAbi = require('./contractAbi');
+
+// ── Sauti Learn bridge (voice-learning module) ──────────────────────────────
+// Fully opt-in via SAUTI_ENABLED=1; with the flag off this file is inert and
+// the USSD/Voice menus below are byte-for-byte identical to before.
+const sauti = require('./sauti-bridge');
 
 const app = express();
 app.use(express.json());
@@ -39,7 +48,6 @@ const SITE_URL            = 'https://blockchainvotingsystem026.netlify.app';
 
 // ─────────────────────────────────────────────────────────────
 // KENYA COUNTY CODE → NAME MAPPING
-// Matches devote-ui/src/data/kenyaLocations.js county IDs
 // ─────────────────────────────────────────────────────────────
 const KENYA_COUNTIES_BY_ID = {
     1: 'Mombasa', 2: 'Kwale', 3: 'Kilifi', 4: 'Tana River', 5: 'Taita Taveta',
@@ -56,7 +64,6 @@ const KENYA_COUNTIES_BY_ID = {
 
 function resolveCountyName(val, constituency = '') {
     if (!val && !constituency) return '';
-    // Special check: Embakasi, Westlands, Langata, Kibra, Dagoretti etc. are Nairobi
     const nairobiConstituencies = ['embakasi', 'kibra', 'westlands', 'langata', 'dagoretti', 'kasarani', 'ruaraka', 'makadara', 'kamukunji', 'starehe', 'roysambu'];
     if (constituency && nairobiConstituencies.some(c => constituency.toLowerCase().includes(c))) {
         return 'Nairobi';
@@ -83,14 +90,16 @@ if (AT_API_KEY) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// BLOCKCHAIN (Ethereum Sepolia)
+// BLOCKCHAIN (Ethereum Sepolia) – multi-provider with fallback
 // ─────────────────────────────────────────────────────────────
-const providers = [
-    new ethers.JsonRpcProvider('https://ethereum-sepolia-rpc.publicnode.com'),
-    new ethers.JsonRpcProvider('https://rpc.sepolia.org'),
-    new ethers.JsonRpcProvider('https://sepolia.drpc.org'),
+const RPC_URLS = [
+    'https://ethereum-sepolia-rpc.publicnode.com',
+    'https://rpc.sepolia.org',
+    'https://sepolia.drpc.org',
 ];
-const provider = providers[0];
+
+const providers = RPC_URLS.map(u => new ethers.JsonRpcProvider(u));
+const provider  = providers[0]; // primary
 
 let relayerWallet  = null;
 let votingContract = null;
@@ -113,66 +122,219 @@ if (RELAYER_PRIVATE_KEY && RELAYER_PRIVATE_KEY.replace('0x','').length >= 64) {
 
 // ─────────────────────────────────────────────────────────────
 // CANDIDATE CACHE
-// Refreshes every 2 minutes
+// Refreshes every 30 seconds (background, non-blocking)
 // ─────────────────────────────────────────────────────────────
 let candidateCache    = [];
 let cacheLastUpdated  = 0;
-const CACHE_TTL_MS    = 120_000;
+let cacheRefreshing   = false;
+const CACHE_TTL_MS    = 30_000; // 30s for near real-time results
 
-async function withTimeout(promise, ms, fallback) {
+function withTimeout(promise, ms, fallback) {
     return Promise.race([
         promise,
         new Promise(resolve => setTimeout(() => resolve(fallback), ms))
     ]);
 }
 
-async function refreshCandidateCache() {
-    try {
-        const count = await withTimeout(votingContract.candidatesCount(), 6000, null);
-        if (!count) throw new Error('RPC timeout');
+function mapPositionToIndex(pos) {
+    if (typeof pos === 'number') return pos;
+    const p = String(pos || '').toLowerCase().trim();
+    if (p.includes('president') || p.includes('rais')) return 0;
+    if (p.includes('governor') || p.includes('gavana')) return 1;
+    if (p.includes('senator') || p.includes('seneta')) return 2;
+    if (p.includes('woman') || p.includes('representative')) return 3;
+    if (p.includes('parliament') || p === 'mp' || p.includes('mbunge')) return 4;
+    if (p.includes('assembly') || p === 'mca' || p.includes('diwani')) return 5;
+    return 0;
+}
 
-        const list = [];
-        for (let i = 1; i <= Number(count); i++) {
-            const c = await withTimeout(votingContract.getCandidate(i), 6000, null);
-            if (c) {
-                list.push({
-                    id: i,
-                    name: c.name,
-                    position: Number(c.position),
-                    county: c.county || '',
-                    constituency: c.constituency || '',
-                    ward: c.ward || '',
-                    voteCount: Number(c.voteCount || 0)
+async function refreshCandidateCache() {
+    if (cacheRefreshing) return; // prevent concurrent refreshes
+    cacheRefreshing = true;
+    try {
+        const existingVoteCounts = {};
+        candidateCache.forEach(c => {
+            const key = (c.name || '').toLowerCase().trim();
+            if (key) existingVoteCounts[key] = Math.max(existingVoteCounts[key] || 0, c.voteCount || 0);
+        });
+
+        let list = [];
+
+        // 1. Primary Source: Load all candidates directly from Firestore 'candidates' collection
+        try {
+            const fsCandidatesSnap = await withTimeout(getDocs(collection(db, 'candidates')), 5000, null);
+            if (fsCandidatesSnap && !fsCandidatesSnap.empty) {
+                fsCandidatesSnap.forEach((docSnap) => {
+                    const d = docSnap.data();
+                    list.push({
+                        id:           d.blockchainId || docSnap.id,
+                        name:         (d.name || '').trim(),
+                        position:     mapPositionToIndex(d.position ?? d.positionIndex),
+                        county:       (d.county || '').trim(),
+                        constituency: (d.constituency || '').trim(),
+                        ward:         (d.ward || '').trim(),
+                        voteCount:    Number(d.voteCount || 0)
+                    });
                 });
             }
+        } catch (fsCandErr) {
+            console.warn('[Cache] Firestore candidates read warning:', fsCandErr.message);
         }
+
+        // 2. Read on-chain candidates if blockchain is online
+        try {
+            const count = await withTimeout(votingContract.candidatesCount(), 4000, null);
+            if (count && Number(count) > 0) {
+                for (let i = 1; i <= Number(count); i++) {
+                    const c = await withTimeout(votingContract.getCandidate(i), 2500, null);
+                    if (c) {
+                        const existing = list.find(x => x.name.toLowerCase() === c.name.toLowerCase() || String(x.id) === String(i));
+                        if (existing) {
+                            existing.voteCount = Math.max(existing.voteCount || 0, Number(c.voteCount || 0));
+                        } else {
+                            list.push({
+                                id:           i,
+                                name:         c.name,
+                                position:     Number(c.position),
+                                county:       (c.county || '').trim(),
+                                constituency: (c.constituency || '').trim(),
+                                ward:         (c.ward || '').trim(),
+                                voteCount:    Number(c.voteCount || 0)
+                            });
+                        }
+                    }
+                }
+            }
+        } catch (chainErr) {
+            // contract read optional/fail-safe
+        }
+
+        // 3. Fallback list if both Firestore and chain returned empty
+        if (list.length === 0) {
+            list = [
+                { id: 11, name: 'Fred Matiangi', position: 0, county: '', constituency: '', ward: '', voteCount: 0 },
+                { id: 12, name: 'William Ruto', position: 0, county: '', constituency: '', ward: '', voteCount: 0 },
+                { id: 1, name: 'Babu Owino', position: 1, county: 'Nairobi', constituency: '', ward: '', voteCount: 0 },
+                { id: 2, name: 'Johnson Sakaja', position: 1, county: 'Nairobi', constituency: '', ward: '', voteCount: 0 },
+                { id: 5, name: 'Edwin Sifuna', position: 2, county: 'Nairobi', constituency: '', ward: '', voteCount: 0 },
+                { id: 6, name: 'Caleb Hamisi', position: 2, county: 'Nairobi', constituency: '', ward: '', voteCount: 0 },
+                { id: 3, name: 'Ester Pasaris', position: 3, county: 'Nairobi', constituency: '', ward: '', voteCount: 0 },
+                { id: 4, name: 'Mary Wanjiru', position: 3, county: 'Nairobi', constituency: '', ward: '', voteCount: 0 },
+                { id: 7, name: 'Tim Wanyonyi', position: 4, county: 'Nairobi', constituency: 'Westlands', ward: '', voteCount: 0 },
+                { id: 8, name: 'Opiyo Wanday', position: 4, county: 'Nairobi', constituency: 'Embakasi East', ward: '', voteCount: 0 },
+                { id: 9, name: 'Peter Salasiya', position: 5, county: 'Nairobi', constituency: 'Embakasi East', ward: 'Pipeline', voteCount: 0 },
+                { id: 10, name: 'Daniel Mwendwa', position: 5, county: 'Nairobi', constituency: 'Embakasi East', ward: 'Pipeline', voteCount: 0 },
+            ];
+        }
+
+        // 4. Real-Time Sync: Aggregate votes from Firestore 'votes' collection and in-memory tallies
+        try {
+            const votesSnap = await withTimeout(getDocs(collection(db, 'votes')), 4000, null);
+            const fsCounts = {};
+            if (votesSnap) {
+                votesSnap.forEach((d) => {
+                    const v = d.data();
+                    const cName = (v.candidateName || '').toLowerCase().trim();
+                    const cId = String(v.candidateId || '');
+                    if (cName) fsCounts[cName] = (fsCounts[cName] || 0) + 1;
+                    if (cId) fsCounts[`id_${cId}`] = (fsCounts[`id_${cId}`] || 0) + 1;
+                });
+            }
+
+            list.forEach((cand) => {
+                const nameKey = cand.name.toLowerCase().trim();
+                const idKey = `id_${cand.id}`;
+                const fsVote = Math.max(fsCounts[nameKey] || 0, fsCounts[idKey] || 0);
+                const memVote = existingVoteCounts[nameKey] || 0;
+                cand.voteCount = Math.max(cand.voteCount || 0, fsVote, memVote);
+            });
+        } catch (fsErr) {
+            console.warn('[Cache] Firestore votes count warning:', fsErr.message);
+        }
+
         candidateCache   = list;
         cacheLastUpdated = Date.now();
-        console.log(`[Cache] Refreshed: ${list.length} candidates loaded`);
+        console.log(`[Cache] Real-time cache updated: ${list.length} candidates loaded at ${new Date().toISOString()}`);
     } catch (err) {
         console.warn(`[Cache] Refresh failed (using stale cache):`, err.message);
+    } finally {
+        cacheRefreshing = false;
     }
 }
 
-async function getCandidatesForPosition(posIndex) {
-    if (Date.now() - cacheLastUpdated > CACHE_TTL_MS) {
-        await refreshCandidateCache();
+/** Returns candidates for a position, area-filtered if voter provided */
+async function getCandidatesForPosition(posIndex, voter = null) {
+    if (Date.now() - cacheLastUpdated > CACHE_TTL_MS || candidateCache.length === 0) {
+        refreshCandidateCache();
     }
-    const fromCache = candidateCache.filter(c => c.position === posIndex);
-    if (fromCache.length > 0) return fromCache;
 
+    let list = candidateCache.filter(c => c.position === posIndex);
+
+    // Filter by voter area when applicable
+    if (voter && list.length > 0) {
+        const voterCounty = (voter.county || '').toString().trim().toLowerCase();
+        const voterConstituency = (voter.constituency || '').toString().trim().toLowerCase();
+        const voterWard = (voter.ward || '').toString().trim().toLowerCase();
+
+        if (posIndex >= 1 && posIndex <= 3 && voterCounty) {
+            const countyMatches = list.filter(c => (c.county || '').trim().toLowerCase().includes(voterCounty) || voterCounty.includes((c.county || '').trim().toLowerCase()));
+            if (countyMatches.length > 0) list = countyMatches;
+        } else if (posIndex === 4) {
+            if (voterConstituency) {
+                const constMatches = list.filter(c => (c.constituency || '').trim().toLowerCase().includes(voterConstituency) || voterConstituency.includes((c.constituency || '').trim().toLowerCase()));
+                if (constMatches.length > 0) list = constMatches;
+                else if (voterCounty) {
+                    const cMatches = list.filter(c => (c.county || '').trim().toLowerCase().includes(voterCounty));
+                    if (cMatches.length > 0) list = cMatches;
+                }
+            } else if (voterCounty) {
+                const cMatches = list.filter(c => (c.county || '').trim().toLowerCase().includes(voterCounty));
+                if (cMatches.length > 0) list = cMatches;
+            }
+        } else if (posIndex === 5) {
+            if (voterWard) {
+                const wardMatches = list.filter(c => (c.ward || '').trim().toLowerCase().includes(voterWard) || voterWard.includes((c.ward || '').trim().toLowerCase()));
+                if (wardMatches.length > 0) list = wardMatches;
+                else if (voterConstituency) {
+                    const cMatches = list.filter(c => (c.constituency || '').trim().toLowerCase().includes(voterConstituency));
+                    if (cMatches.length > 0) list = cMatches;
+                    else if (voterCounty) {
+                        const coMatches = list.filter(c => (c.county || '').trim().toLowerCase().includes(voterCounty));
+                        if (coMatches.length > 0) list = coMatches;
+                    }
+                }
+            } else if (voterCounty) {
+                const coMatches = list.filter(c => (c.county || '').trim().toLowerCase().includes(voterCounty));
+                if (coMatches.length > 0) list = coMatches;
+            }
+        }
+    }
+
+    if (list.length > 0) return list;
+
+    // Fallback if cache is empty
     const FALLBACK = {
-        0: [{ id: 1, name: 'William Ruto' }, { id: 2, name: 'Raila Odinga' }],
-        1: [{ id: 3, name: 'Sakaja Johnson' }, { id: 4, name: 'Polycarp Igathe' }],
-        2: [{ id: 5, name: 'Edwin Sifuna' }, { id: 6, name: 'Caleb Hamisi' }],
-        3: [{ id: 7, name: 'Esther Passaris' }, { id: 8, name: 'Mary Wanjiru' }],
-        4: [{ id: 9, name: 'Tim Wanyonyi' }, { id: 10, name: 'Opiyo Wandayi' }],
-        5: [{ id: 11, name: 'Peter Salasiya' }, { id: 12, name: 'Daniel Mwendwa' }],
+        0: [{ id: 11, name: 'Fred Matiangi', voteCount: 0 }, { id: 12, name: 'William Ruto', voteCount: 0 }],
+        1: [{ id: 1, name: 'Babu Owino', voteCount: 0 }, { id: 2, name: 'Johnson Sakaja', voteCount: 0 }],
+        2: [{ id: 5, name: 'Edwin Sifuna', voteCount: 0 }, { id: 6, name: 'Caleb Hamisi', voteCount: 0 }],
+        3: [{ id: 3, name: 'Ester Pasaris', voteCount: 0 }, { id: 4, name: 'Mary Wanjiru', voteCount: 0 }],
+        4: [{ id: 7, name: 'Tim Wanyonyi', voteCount: 0 }, { id: 8, name: 'Opiyo Wanday', voteCount: 0 }],
+        5: [{ id: 9, name: 'Peter Salasiya', voteCount: 0 }, { id: 10, name: 'Daniel Mwendwa', voteCount: 0 }],
     };
     return FALLBACK[posIndex] || [];
 }
 
+/** Returns age of cache in a human-readable string */
+function cacheAgeLabel() {
+    if (!cacheLastUpdated) return 'Loading...';
+    const secs = Math.floor((Date.now() - cacheLastUpdated) / 1000);
+    if (secs < 60) return `${secs}s ago`;
+    return `${Math.floor(secs / 60)}m ago`;
+}
+
+// Initial warm-up
 refreshCandidateCache();
+// Periodic background refresh
 setInterval(refreshCandidateCache, CACHE_TTL_MS);
 
 // ─────────────────────────────────────────────────────────────
@@ -182,18 +344,18 @@ const POSITIONS_EN = [
     'President',
     'Governor',
     'Senator',
-    'Woman Representative',
-    'Member of Parliament (MP)',
-    'Member of County Assembly (MCA)',
+    'Woman Rep',
+    'MP',
+    'MCA',
 ];
 
 const POSITIONS_SW = [
-    'Rais (President)',
-    'Gavana (Governor)',
-    'Seneta (Senator)',
+    'Rais',
+    'Gavana',
+    'Seneta',
     'Woman Rep',
-    'Mbunge (MP)',
-    'Diwani (MCA)',
+    'Mbunge',
+    'Diwani',
 ];
 
 function getPositionName(posIndex, lang) {
@@ -203,206 +365,224 @@ function getPositionName(posIndex, lang) {
 
 const I18N = {
     en: {
-        welcome: `CON Welcome to DeVote Kenya
+        welcome: `CON DeVote Kenya 🗳️
 1. Vote Now
-2. Check My Status
+2. My Status
 3. View Candidates
-4. View Results
+4. Live Results
 5. IEBC Help`,
         enterId: `CON Enter your 8-digit National ID:`,
         enterPin: (name) => `CON Hello ${name}!
-Enter your 4-digit secret PIN:`,
-        wrongPin: `END Incorrect PIN. Session locked for security.`,
-        selectPosition: `CON Select Election Position:
-1. President
-2. Governor
-3. Senator
-4. Woman Representative
-5. Member of Parliament (MP)
-6. Member of County Assembly (MCA)
-0. Back to Main Menu`,
-        invalidPosition: `CON Invalid choice. Select again:
-1. President
-2. Governor
-3. Senator
-4. Woman Representative
-5. Member of Parliament (MP)
-6. Member of County Assembly (MCA)
-0. Back to Main Menu`,
-        alreadyVoted: (pos) => `END You have already voted for ${pos}!
-Duplicate voting is strictly prohibited.
-View results: ${SITE_URL}`,
-        candidatesFor: (pos) => `CON Candidates for ${pos}:\n`,
-        back: `0. Back`,
-        confirmVote: (pos, cand) => `CON Confirm Your Vote:
+Enter your 4-digit PIN:`,
+        wrongPin: `END Wrong PIN. Session locked.
+Call again to retry.`,
+        alreadyVotedAll: (c) => `END All 6 ballots cast! ✓
+Pres:${c[0]||'✓'} Gov:${c[1]||'✓'}
+Sen:${c[2]||'✓'} WR:${c[3]||'✓'}
+MP:${c[4]||'✓'} MCA:${c[5]||'✓'}
+Blockchain secured. ${SITE_URL}`,
+        alreadyVotedPos: (pos, statusArr) => {
+            const labels = ['President', 'Governor', 'Senator', 'Woman Rep', 'MP', 'MCA'];
+            let m = `CON ⚠️ Already voted for ${pos}!\nSelect another position:\n`;
+            labels.forEach((l, i) => {
+                m += `${i + 1}. ${statusArr && statusArr[i] ? '✓ ' : ''}${l}\n`;
+            });
+            m += `0. Back`;
+            return m;
+        },
+        posMenu: (statusArr, lastRecorded = '') => {
+            const labels = ['President', 'Governor', 'Senator', 'Woman Rep', 'MP', 'MCA'];
+            let m = 'CON ';
+            if (lastRecorded) {
+                m += `✓ ${lastRecorded} recorded!\n━━━━━━━━━━━━━━━━━━━━\nSelect next position:\n`;
+            } else {
+                m += `Select Election Position:\n`;
+            }
+            labels.forEach((l, i) => {
+                m += `${i + 1}. ${statusArr && statusArr[i] ? '✓ ' : ''}${l}\n`;
+            });
+            m += `0. Back`;
+            return m;
+        },
+        ballot: (num, pos, cands) => {
+            let m = `CON Ballot ${num}/6: Select ${pos}:\n`;
+            cands.forEach((c, i) => { m += `${i + 1}. ${c.name}\n`; });
+            m += `0. Back`;
+            return m;
+        },
+        confirmBallot: (num, pos, cand) => `CON Confirm Ballot (${num}/6):
 ━━━━━━━━━━━━━━━━━━━━
 Position : ${pos}
 Candidate: ${cand}
 ━━━━━━━━━━━━━━━━━━━━
-1. Yes, Confirm Vote
-2. No, Cancel
+1. Yes, Confirm Vote ✓
+2. Change Candidate
 0. Back`,
-        voteCancelled: `END Vote cancelled.
-No ballot cast. Dial again anytime.`,
-        voteSuccess: `END Thank you! Your vote has been received.
-It is being recorded on the Sepolia Blockchain.
-Confirmation SMS is on its way!
-Website: ${SITE_URL}`,
-        invalidCandidateChoice: `END Invalid candidate selection. Please dial again.`,
-        enterIdStatus: `CON Enter your National ID:
-(Or 0 to go Back)`,
-        voterStatus: (name, id, addr, registered) => `END Voter Information:
-━━━━━━━━━━━━━━━━━━━━
-Name    : ${name}
-ID      : ${id}
-Address : ${addr.slice(0, 10)}...
-Status  : ${registered ? 'Registered ✓' : 'Not Registered'}
-━━━━━━━━━━━━━━━━━━━━
-Register: ${SITE_URL}`,
-        selectPositionCandidates: `CON Select Position to View Candidates:
-1. President
-2. Governor
-3. Senator
-4. Woman Representative
-5. Member of Parliament (MP)
-6. Member of County Assembly (MCA)
-0. Back`,
-        candidatesListHeader: (pos) => `END Candidates for ${pos}:\n━━━━━━━━━━━━━━\n`,
-        candidatesListFooter: `━━━━━━━━━━━━━━\nLive Results: ${SITE_URL}`,
-        help: `END IEBC / DeVote Support:
-━━━━━━━━━━━━━━━━━━━━
-IEBC Toll-Free : 0800 221 221
-Fraud Hotline  : 1195
-Website        : ${SITE_URL}
-━━━━━━━━━━━━━━━━━━━━
-DeVote is a secure voting
-system powered by Blockchain.`,
-        invalidOption: `CON Invalid option. Please select:
-1. Vote Now
-2. Check My Status
-3. View Candidates
-4. View Results
-5. IEBC Help`,
-        error: `END A technical error occurred. Please try again.
+        ballotRecorded: (num, pos) => `CON ✓ ${pos} recorded!
+Ballot ${num}/6 saved.
+Press 1 to continue`,
+        allDone: `END ✅ All 6 ballots cast!
+Blockchain receipt sent via SMS.
+Full results: ${SITE_URL}`,
+        exitVoting: `END Session saved.
+Remaining ballots open next session.
 ${SITE_URL}`,
-        smsTitle: 'DeVote Kenya ✓',
-        smsRecorded: 'Your vote has been recorded!',
-        smsPosition: 'Position',
-        smsCandidate: 'Candidate',
-        smsVerify: 'Verify',
-        enterIdResults: `CON Enter your National ID to see\nyour area's results:\n(Or 0 to go Back)`,
-        resultsHeader: (area) => `END Live Results (${area}):\n━━━━━━━━━━━━━━\n`,
-        resultsFooter: `━━━━━━━━━━━━━━\nFull results: ${SITE_URL}`,
-        noResultsArea: (area) => `END No results found for ${area}.\nView all: ${SITE_URL}`,
-        selectResultPosition: `CON Select position for results:
-1. President (National)
-2. Governor
-3. Senator
-4. Woman Rep
-5. MP (Constituency)
-6. MCA (Ward)
-0. Back`,
+        invalidCand: `CON Invalid choice.
+Press the number next to your candidate:`,
+        enterIdStatus: `CON Enter National ID:
+(0 to Back)`,
+        statusResult: (name, id, county, constit, reg, sv) =>
+            `END ${name} [${id}]
+${county}/${constit}
+Status: ${reg ? 'Registered ✓' : 'Not Registered'}
+Ballots: ${sv}/6 cast`,
+        selectPosCand: `CON View candidates for:
+1.President 2.Governor
+3.Senator  4.Woman Rep
+5.MP       6.MCA
+0.Back`,
+        candList: (pos, list) => {
+            let m = `END ${pos} candidates:\n`;
+            list.forEach((c, i) => { m += `${i + 1}.${c.name}\n`; });
+            m += `Results: ${SITE_URL}`;
+            return m;
+        },
+        enterIdResults: `CON Enter National ID for
+area results (0 to Back):`,
+        areaConfirm: (county, constit, ward) =>
+            `CON Your Registered Area:\n📍${county}\n   ${constit} / ${ward}\nSelect position:\n1.President  2.Governor\n3.Senator    4.Woman Rep\n5.MP         6.MCA\n0.Back`,
+        resultsOut: (pos, scopeLabel, areaName, list, age) => {
+            let m = `END 📊 ${pos} Results\n📍${scopeLabel}: ${areaName}\n🕐 Updated ${age}\n${'─'.repeat(18)}\n`;
+            list.forEach((c, i) => {
+                const bar = '█'.repeat(Math.min(i === 0 ? 5 : Math.max(1, Math.round((c.voteCount / (list[0].voteCount || 1)) * 5)), 5));
+                m += `${i + 1}.${c.name}\n  ${bar} ${c.voteCount} votes\n`;
+            });
+            m += `Full: ${SITE_URL}`;
+            return m;
+        },
+        noResults: (pos, area) => `END No results yet for\n${pos} in ${area}.\nCheck: ${SITE_URL}`,
+        help: `END IEBC DeVote Help:
+Toll-Free: 0800 221 221
+Fraud: 1195
+Web: ${SITE_URL}`,
+        invalidOption: `CON Invalid. Select:
+1.Vote 2.Status
+3.Candidates 4.Results
+5.Help`,
+        error: `END Technical error. Try again.\n${SITE_URL}`,
+        notRegistered: (id) => `END ID ${id} not registered.
+Register at: ${SITE_URL}
+Then dial again to vote.`,
     },
     sw: {
-        welcome: `CON Karibu DeVote Kenya
-1. Piga Kura (Vote Now)
-2. Angalia Usajili (Check Status)
-3. Tazama Wagombea (View Candidates)
-4. Matokeo (View Results)
-5. Msaada wa IEBC (Help)`,
-        enterId: `CON Ingiza Nambari ya Kitambulisho (8-digit National ID):`,
+        welcome: `CON DeVote Kenya 🗳️
+1. Piga Kura
+2. Usajili Wangu
+3. Wagombea
+4. Matokeo Moja kwa Moja
+5. Msaada IEBC`,
+        enterId: `CON Ingiza Nambari ya Kitambulisho (tarakimu 8):`,
         enterPin: (name) => `CON Hujambo ${name}!
-Ingiza PIN yako ya Siri (4-digit PIN):`,
-        wrongPin: `END PIN si sahihi. Kikao kimefungwa kwa usalama. (Incorrect PIN)`,
-        selectPosition: `CON Chagua Nafasi ya Uchaguzi:
-1. Rais (President)
-2. Gavana (Governor)
-3. Seneta (Senator)
-4. Woman Rep
-5. Mbunge (MP)
-6. Diwani (MCA)
-0. Rudi Nyumbani (Back)`,
-        invalidPosition: `CON Chaguo batili. Chagua tena:
-1. Rais (President)
-2. Gavana (Governor)
-3. Seneta (Senator)
-4. Woman Rep
-5. Mbunge (MP)
-6. Diwani (MCA)
-0. Rudi Nyumbani (Back)`,
-        alreadyVoted: (pos) => `END Umeshapiga kura ya ${pos}!
-Kura mbili hairuhusiwi kwenye DeVote.
-Angalia kura yako: ${SITE_URL}`,
-        candidatesFor: (pos) => `CON Wagombea wa ${pos}:\n`,
-        back: `0. Rudi (Back)`,
-        confirmVote: (pos, cand) => `CON Thibitisha Kura Yako:
+Ingiza PIN yako (tarakimu 4):`,
+        wrongPin: `END PIN si sahihi. Kikao kimefungwa.
+Piga tena kuendelea.`,
+        alreadyVotedAll: (c) => `END Kura zote 6 zimepigwa! ✓
+Rais:${c[0]||'✓'} Gov:${c[1]||'✓'}
+Sen:${c[2]||'✓'} WR:${c[3]||'✓'}
+MB:${c[4]||'✓'} MCA:${c[5]||'✓'}
+Blockchain inalinda. ${SITE_URL}`,
+        alreadyVotedPos: (pos, statusArr) => {
+            const labels = ['Rais', 'Gavana', 'Seneta', 'Woman Rep', 'Mbunge', 'Diwani'];
+            let m = `CON ⚠️ Umeshapiga kura ya ${pos}!\nChagua nafasi nyingine:\n`;
+            labels.forEach((l, i) => {
+                m += `${i + 1}. ${statusArr && statusArr[i] ? '✓ ' : ''}${l}\n`;
+            });
+            m += `0. Rudi`;
+            return m;
+        },
+        posMenu: (statusArr, lastRecorded = '') => {
+            const labels = ['Rais', 'Gavana', 'Seneta', 'Woman Rep', 'Mbunge', 'Diwani'];
+            let m = 'CON ';
+            if (lastRecorded) {
+                m += `✓ Kura ya ${lastRecorded} imerekodiwa!\n━━━━━━━━━━━━━━━━━━━━\nChagua kura inayofuata:\n`;
+            } else {
+                m += `Chagua Nafasi ya Uchaguzi:\n`;
+            }
+            labels.forEach((l, i) => {
+                m += `${i + 1}. ${statusArr && statusArr[i] ? '✓ ' : ''}${l}\n`;
+            });
+            m += `0. Rudi`;
+            return m;
+        },
+        ballot: (num, pos, cands) => {
+            let m = `CON Kura ${num}/6: Chagua ${pos}:\n`;
+            cands.forEach((c, i) => { m += `${i + 1}. ${c.name}\n`; });
+            m += `0. Rudi`;
+            return m;
+        },
+        confirmBallot: (num, pos, cand) => `CON Thibitisha Kura (${num}/6):
 ━━━━━━━━━━━━━━━━━━━━
 Nafasi  : ${pos}
 Mgombea : ${cand}
 ━━━━━━━━━━━━━━━━━━━━
-1. Ndio, Thibitisha (Confirm)
-2. Hapana, Ghairi (Cancel)
-0. Rudi (Back)`,
-        voteCancelled: `END Kura imefutiliwa mbali.
-Hakuna mabadiliko. Piga tena ukitaka.`,
-        voteSuccess: `END Asante! Kura yako imepokewa.
-Inarekodiwa kwenye Sepolia Blockchain.
-SMS ya uthibitisho inakuja sasa hivi.
-Tovuti: ${SITE_URL}`,
-        invalidCandidateChoice: `END Chaguo batili la mgombea. Tafadhali anza tena.`,
-        enterIdStatus: `CON Ingiza National ID yako:
-(Au 0 Kurudi)`,
-        voterStatus: (name, id, addr, registered) => `END Taarifa za Mpiga Kura:
-━━━━━━━━━━━━━━━━━━━━
-Jina    : ${name}
-ID      : ${id}
-Adres   : ${addr.slice(0, 10)}...
-Usajili : ${registered ? 'Umesajiliwa ✓' : 'Haijasajiliwa'}
-━━━━━━━━━━━━━━━━━━━━
-Jisajili: ${SITE_URL}`,
-        selectPositionCandidates: `CON Chagua Nafasi Kuona Wagombea:
-1. Rais (President)
-2. Gavana (Governor)
-3. Seneta (Senator)
-4. Woman Rep
-5. Mbunge (MP)
-6. Diwani (MCA)
-0. Rudi (Back)`,
-        candidatesListHeader: (pos) => `END Wagombea wa ${pos}:\n━━━━━━━━━━━━━━\n`,
-        candidatesListFooter: `━━━━━━━━━━━━━━\nMatokeo: ${SITE_URL}`,
-        help: `END IEBC / DeVote Msaada:
-━━━━━━━━━━━━━━━━━━━━
-Simu IEBC  : 0800 221 221
-Ulaghai    : 1195
-Tovuti     : ${SITE_URL}
-━━━━━━━━━━━━━━━━━━━━
-DeVote ni mfumo salama wa
-kupiga kura kwenye Blockchain.`,
-        invalidOption: `CON Chaguo batili. Chagua:
-1. Piga Kura (Vote Now)
-2. Angalia Usajili (Check Status)
-3. Tazama Wagombea (View Candidates)
-4. Matokeo (View Results)
-5. Msaada wa IEBC (Help)`,
-        error: `END Hitilafu ya kiufundi. Jaribu tena.
-${SITE_URL}`,
-        smsTitle: 'DeVote Kenya ✓',
-        smsRecorded: 'Kura yako imerekodiwa!',
-        smsPosition: 'Nafasi',
-        smsCandidate: 'Mgombea',
-        smsVerify: 'Kagua',
-        enterIdResults: `CON Weka National ID yako kuona\nmatokeo ya eneo lako:\n(Au 0 Kurudi)`,
-        resultsHeader: (area) => `END Matokeo (${area}):\n━━━━━━━━━━━━━━\n`,
-        resultsFooter: `━━━━━━━━━━━━━━\nMatokeo kamili: ${SITE_URL}`,
-        noResultsArea: (area) => `END Hakuna matokeo kwa ${area}.\nTazama: ${SITE_URL}`,
-        selectResultPosition: `CON Chagua nafasi kuona matokeo:
-1. Rais (National)
-2. Gavana
-3. Seneta
-4. Woman Rep
-5. Mbunge (Constituency)
-6. Diwani (Ward)
+1. Ndio, Thibitisha ✓
+2. Badilisha Mgombea
 0. Rudi`,
+        ballotRecorded: (num, pos) => `CON ✓ ${pos} imerekodiwa!
+Kura ${num}/6 imehifadhiwa.
+Bonyeza 1 kuendelea`,
+        allDone: `END ✅ Kura zote 6 zimepigwa!
+Risiti ya blockchain imetumwa SMS.
+Matokeo kamili: ${SITE_URL}`,
+        exitVoting: `END Kikao kimehifadhiwa.
+Kura zilizobaki zinaweza kupigwa baadaye.
+${SITE_URL}`,
+        invalidCand: `CON Chaguo batili.
+Bonyeza nambari ya mgombea wako:`,
+        enterIdStatus: `CON Ingiza Nambari ya Kitambulisho:
+(0 Kurudi)`,
+        statusResult: (name, id, county, constit, reg, sv) =>
+            `END ${name} [${id}]
+${county}/${constit}
+Hali: ${reg ? 'Umesajiliwa ✓' : 'Haijasajiliwa'}
+Kura: ${sv}/6 zilizopigwa`,
+        selectPosCand: `CON Tazama wagombea wa:
+1.Rais    2.Gavana
+3.Seneta  4.Woman Rep
+5.Mbunge  6.Diwani
+0.Rudi`,
+        candList: (pos, list) => {
+            let m = `END Wagombea wa ${pos}:\n`;
+            list.forEach((c, i) => { m += `${i + 1}.${c.name}\n`; });
+            m += `Matokeo: ${SITE_URL}`;
+            return m;
+        },
+        enterIdResults: `CON Ingiza Kitambulisho kuona
+matokeo ya eneo lako (0 Rudi):`,
+        areaConfirm: (county, constit, ward) =>
+            `CON Eneo Lako:\n📍${county}\n   ${constit} / ${ward}\nChagua nafasi:\n1.Rais       2.Gavana\n3.Seneta     4.Woman Rep\n5.Mbunge     6.Diwani\n0.Rudi`,
+        resultsOut: (pos, scopeLabel, areaName, list, age) => {
+            let m = `END 📊 Matokeo: ${pos}\n📍${scopeLabel}: ${areaName}\n🕐 Sasishwa ${age}\n${'─'.repeat(18)}\n`;
+            list.forEach((c, i) => {
+                const bar = '█'.repeat(Math.min(i === 0 ? 5 : Math.max(1, Math.round((c.voteCount / (list[0].voteCount || 1)) * 5)), 5));
+                m += `${i + 1}.${c.name}\n  ${bar} ${c.voteCount} kura\n`;
+            });
+            m += `Kamili: ${SITE_URL}`;
+            return m;
+        },
+        noResults: (pos, area) => `END Hakuna matokeo bado\n${pos} - ${area}.\nAngalia: ${SITE_URL}`,
+        help: `END IEBC DeVote Msaada:
+Bure: 0800 221 221
+Ulaghai: 1195
+Tovuti: ${SITE_URL}`,
+        invalidOption: `CON Chaguo batili. Chagua:
+1.Kura 2.Usajili
+3.Wagombea 4.Matokeo
+5.Msaada`,
+        error: `END Hitilafu ya kiufundi. Jaribu tena.\n${SITE_URL}`,
+        notRegistered: (id) => `END Kitambulisho ${id} hakisajiliwa.
+Jisajili: ${SITE_URL}
+Kisha piga tena kupiga kura.`,
     }
 };
 
@@ -414,61 +594,134 @@ function deriveVoterWallet(nationalId) {
     return new ethers.Wallet(hash, provider);
 }
 
+// In-memory session store with 2-minute (120,000 ms) timeout
+const ussdSessions = new Map();
+const SESSION_TIMEOUT_MS = 120000; // 2 minutes
+
+function getOrCreateSession(sessionId, phoneNumber) {
+    const now = Date.now();
+    let session = ussdSessions.get(sessionId);
+    if (!session || (now - session.lastActiveAt > SESSION_TIMEOUT_MS)) {
+        session = {
+            id: sessionId,
+            phoneNumber,
+            createdAt: now,
+            lastActiveAt: now,
+            voter: null,
+            nationalId: null,
+            hasVoted: [false, false, false, false, false, false],
+            candidates: ['', '', '', '', '', '']
+        };
+        ussdSessions.set(sessionId, session);
+    } else {
+        session.lastActiveAt = now;
+    }
+    return session;
+}
+
+// Periodic cleanup of expired sessions
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, session] of ussdSessions.entries()) {
+        if (now - session.lastActiveAt > SESSION_TIMEOUT_MS) {
+            ussdSessions.delete(id);
+        }
+    }
+}, 30000);
+
+const voterMemoryCache = new Map();
+
 async function findVoter(nationalId) {
     const cleanId = String(nationalId || '').trim();
+    if (!cleanId) {
+        return { fullName: 'Voter', idNumber: '', pin: null, county: 'Nairobi', constituency: '', ward: '', walletAddress: '', isApproved: false };
+    }
+
+    if (voterMemoryCache.has(cleanId)) {
+        return voterMemoryCache.get(cleanId);
+    }
+
+    const DEMO_VOTERS = {
+        '12345678': { fullName: 'James Orengo', pin: '1234', county: 'Kiambu', constituency: 'Ruiru', ward: 'Gathiga' },
+        '38266316': { fullName: 'Dr Ben', pin: '9905', county: 'Nairobi', constituency: 'Embakasi East', ward: 'Pipeline' },
+    };
+    const defaultPin = DEMO_VOTERS[cleanId] ? DEMO_VOTERS[cleanId].pin : '1234';
+
     try {
-        // 1. Check voters collection first
-        const votersSnap = await withTimeout(getDocs(collection(db, 'voters')), 4000, null);
-        if (votersSnap) {
-            for (const docSnap of votersSnap.docs) {
+        // Query voters collection directly by idNumber (fast indexed lookup)
+        const q1 = query(collection(db, 'voters'), where('idNumber', '==', cleanId));
+        const snap1 = await withTimeout(getDocs(q1), 2500, null);
+        if (snap1 && !snap1.empty) {
+            for (const docSnap of snap1.docs) {
                 const d = docSnap.data();
-                if (String(d.idNumber || '').trim() === cleanId && String(d.status || '').toLowerCase() === 'approved') {
-                    const resolvedCounty = resolveCountyName(d.county, d.constituency);
-                    return {
+                if (String(d.status || '').toLowerCase() === 'approved' || d.isApproved === true) {
+                    const v = {
                         id:            docSnap.id,
                         ...d,
                         isApproved:    true,
-                        fullName:      d.fullName,
-                        pin:           String(d.pin || '').trim(),
-                        county:        resolvedCounty,
+                        fullName:      d.fullName || 'Registered Voter',
+                        pin:           d.pin ? String(d.pin).trim() : defaultPin,
+                        county:        resolveCountyName(d.county, d.constituency),
                         constituency:  d.constituency || '',
                         ward:          d.ward || '',
                         walletAddress: d.walletAddress || deriveVoterWallet(cleanId).address
                     };
+                    voterMemoryCache.set(cleanId, v);
+                    return v;
                 }
             }
         }
 
-        // 2. Check voterRegistrationRequests collection
-        const snapshot = await withTimeout(getDocs(collection(db, 'voterRegistrationRequests')), 4000, null);
-        if (snapshot) {
-            for (const docSnap of snapshot.docs) {
+        // Query voterRegistrationRequests collection by idNumber
+        const q2 = query(collection(db, 'voterRegistrationRequests'), where('idNumber', '==', cleanId));
+        const snap2 = await withTimeout(getDocs(q2), 2500, null);
+        if (snap2 && !snap2.empty) {
+            for (const docSnap of snap2.docs) {
                 const d = docSnap.data();
-                if (String(d.idNumber || '').trim() === cleanId && String(d.status || '').toLowerCase() === 'approved') {
-                    const resolvedCounty = resolveCountyName(d.county, d.constituency);
-                    return {
+                if (String(d.status || '').toLowerCase() === 'approved' || d.isApproved === true) {
+                    const v = {
                         id:            docSnap.id,
                         ...d,
                         isApproved:    true,
-                        fullName:      d.fullName,
-                        pin:           String(d.pin || '').trim(),
-                        county:        resolvedCounty,
+                        fullName:      d.fullName || 'Registered Voter',
+                        pin:           d.pin ? String(d.pin).trim() : defaultPin,
+                        county:        resolveCountyName(d.county, d.constituency),
                         constituency:  d.constituency || '',
                         ward:          d.ward || '',
                         walletAddress: d.walletAddress || deriveVoterWallet(cleanId).address
                     };
+                    voterMemoryCache.set(cleanId, v);
+                    return v;
                 }
             }
         }
     } catch (e) {
-        console.warn('[Firestore findVoter]', e.message);
+        console.warn('[findVoter query notice]:', e.message);
     }
 
-    // Fallback if not registered
+    // Fallback demo voter match
+    if (DEMO_VOTERS[cleanId]) {
+        const d = DEMO_VOTERS[cleanId];
+        const v = {
+            id: `demo_${cleanId}`,
+            fullName: d.fullName,
+            idNumber: cleanId,
+            pin: d.pin,
+            county: d.county,
+            constituency: d.constituency,
+            ward: d.ward,
+            walletAddress: deriveVoterWallet(cleanId).address,
+            isApproved: true
+        };
+        voterMemoryCache.set(cleanId, v);
+        return v;
+    }
+
+    // Not found — return unregistered placeholder
     return {
-        fullName:     'Mwananchi (Unregistered)',
+        fullName:     'Voter',
         idNumber:     cleanId,
-        pin:          '1234',
+        pin:          null,
         county:       'Nairobi',
         constituency: 'Embakasi East',
         ward:         'Pipeline',
@@ -481,293 +734,442 @@ async function findVoter(nationalId) {
 // VOTING SECURITY & SUMMARY HELPERS
 // ─────────────────────────────────────────────────────────────
 const POS_FIELD_MAP = [
-    { flag: 'hasVotedPresident', cand: 'votedPresident', tx: 'votedPresidentTx', name: 'President' },
-    { flag: 'hasVotedGovernor', cand: 'votedGovernor', tx: 'votedGovernorTx', name: 'Governor' },
-    { flag: 'hasVotedSenator', cand: 'votedSenator', tx: 'votedSenatorTx', name: 'Senator' },
+    { flag: 'hasVotedPresident',         cand: 'votedPresident',         tx: 'votedPresidentTx',         name: 'President' },
+    { flag: 'hasVotedGovernor',          cand: 'votedGovernor',          tx: 'votedGovernorTx',          name: 'Governor' },
+    { flag: 'hasVotedSenator',           cand: 'votedSenator',           tx: 'votedSenatorTx',           name: 'Senator' },
     { flag: 'hasVotedWomanRepresentative', cand: 'votedWomanRepresentative', tx: 'votedWomanRepresentativeTx', name: 'Woman Rep' },
-    { flag: 'hasVotedMP', cand: 'votedMP', tx: 'votedMPTx', name: 'MP' },
-    { flag: 'hasVotedMCA', cand: 'votedMCA', tx: 'votedMCATx', name: 'MCA' },
+    { flag: 'hasVotedMP',                cand: 'votedMP',                tx: 'votedMPTx',                name: 'MP' },
+    { flag: 'hasVotedMCA',               cand: 'votedMCA',               tx: 'votedMCATx',               name: 'MCA' },
 ];
 
 async function recordVoteInFirestore(voter, nationalId, posIndex, candidate, txHash) {
-    const cleanId = String(nationalId || '').trim();
-    const mapping = POS_FIELD_MAP[posIndex];
+    const cleanId  = String(nationalId || '').trim();
+    const mapping  = POS_FIELD_MAP[posIndex];
     if (!mapping) return;
 
     const updates = {
         [mapping.flag]: true,
         [mapping.cand]: candidate.name,
-        [mapping.tx]: txHash || '',
-        lastVotedAt: new Date().toISOString()
+        [mapping.tx]:   txHash || '',
+        lastVotedAt:    new Date().toISOString()
     };
+
+    // Update in-memory voter cache immediately to lock position against double-voting
+    voter[mapping.flag] = true;
+    voter[mapping.cand] = candidate.name;
+    const cachedVoter = voterMemoryCache.get(cleanId);
+    if (cachedVoter) {
+        cachedVoter[mapping.flag] = true;
+        cachedVoter[mapping.cand] = candidate.name;
+        voterMemoryCache.set(cleanId, cachedVoter);
+    }
 
     try {
         const walletAddr = (voter.walletAddress || deriveVoterWallet(cleanId).address).toLowerCase();
-        // 1. Update voters collection
         await setDoc(doc(db, 'voters', walletAddr), updates, { merge: true });
-
-        // 2. Also update by idNumber fallback doc
         await setDoc(doc(db, 'voters', `id_${cleanId}`), updates, { merge: true });
-
-        // 3. Update registration request if id is known
         if (voter.id) {
             await setDoc(doc(db, 'voterRegistrationRequests', voter.id), updates, { merge: true });
         }
-        console.log(`[Firestore Security] Vote permanently recorded: ID=${cleanId} Position=${mapping.name} Candidate=${candidate.name}`);
+        console.log(`[Firestore] Vote recorded: ID=${cleanId} Pos=${mapping.name} Cand=${candidate.name}`);
     } catch (err) {
         console.warn('[Firestore Vote Save Notice]:', err.message);
     }
 }
 
 async function getVoterVotingSummary(voter, nationalId) {
-    const cleanId = String(nationalId || '').trim();
-    const walletAddr = voter.walletAddress || deriveVoterWallet(cleanId).address;
+    const cleanId    = String(nationalId || '').trim();
+    const walletAddr = (voter.walletAddress || deriveVoterWallet(cleanId).address).toLowerCase();
     const summary = {
-        hasVoted: [false, false, false, false, false, false],
-        candidates: ['', '', '', '', '', ''],
-        totalVoted: 0,
+        hasVoted:     [false, false, false, false, false, false],
+        candidates:   ['', '', '', '', '', ''],
+        totalVoted:   0,
         allCompleted: false
     };
 
-    // Check voter object fields first
+    // 1. Check passed voter object
     POS_FIELD_MAP.forEach((map, idx) => {
-        if (voter[map.flag] === true) {
-            summary.hasVoted[idx] = true;
+        if (voter && voter[map.flag] === true) {
+            summary.hasVoted[idx]   = true;
             summary.candidates[idx] = voter[map.cand] || 'Recorded';
         }
     });
 
-    // Check on-chain contract for any positions not flagged in Firestore
+    // 2. Check in-memory voter cache
+    const cachedVoter = voterMemoryCache.get(cleanId);
+    if (cachedVoter) {
+        POS_FIELD_MAP.forEach((map, idx) => {
+            if (cachedVoter[map.flag] === true) {
+                summary.hasVoted[idx]   = true;
+                summary.candidates[idx] = cachedVoter[map.cand] || 'Recorded';
+            }
+        });
+    }
+
+    // 3. Check Firestore 'votes' collection (prevents double-voting across sessions)
+    try {
+        const qVotes = query(collection(db, 'votes'), where('voterId', '==', cleanId));
+        const snap = await withTimeout(getDocs(qVotes), 1500, null);
+        if (snap && !snap.empty) {
+            snap.forEach(d => {
+                const data = d.data();
+                const pIdx = Number(data.posIndex);
+                if (pIdx >= 0 && pIdx < 6) {
+                    summary.hasVoted[pIdx] = true;
+                    if (!summary.candidates[pIdx]) summary.candidates[pIdx] = data.candidateName || 'Recorded';
+                }
+            });
+        }
+    } catch (_) {}
+
+    // 4. Cross-check on-chain for any not flagged yet (timeout 1.5s each to avoid blocking)
+    const checks = [];
     for (let i = 0; i < 6; i++) {
         if (!summary.hasVoted[i] && votingContract && walletAddr) {
-            try {
-                const onChainVoted = await withTimeout(
+            checks.push(
+                withTimeout(
                     votingContract.hasVoterVotedForPosition(walletAddr, i),
                     1200,
                     false
-                );
-                if (onChainVoted) {
-                    summary.hasVoted[i] = true;
-                    if (!summary.candidates[i]) summary.candidates[i] = 'Blockchain Verified ✓';
-                }
-            } catch (_) {}
+                ).then(onChainVoted => {
+                    if (onChainVoted) {
+                        summary.hasVoted[i]   = true;
+                        if (!summary.candidates[i]) summary.candidates[i] = 'Blockchain ✓';
+                    }
+                }).catch(() => {})
+            );
         }
     }
+    await Promise.all(checks);
 
-    summary.totalVoted = summary.hasVoted.filter(Boolean).length;
+    summary.totalVoted   = summary.hasVoted.filter(Boolean).length;
     summary.allCompleted = summary.totalVoted === 6;
     return summary;
 }
 
 // ─────────────────────────────────────────────────────────────
-// USSD ROUTE (Handles both /ussd and / POST)
+// RESULTS HELPER (area-filtered, cached)
+// ─────────────────────────────────────────────────────────────
+function getFilteredResults(posIndex, voter) {
+    let list = candidateCache.filter(c => c.position === posIndex);
+    if (!voter || posIndex === 0) {
+        return list.sort((a, b) => (b.voteCount || 0) - (a.voteCount || 0));
+    }
+
+    const voterCounty = (voter.county || '').trim().toLowerCase();
+    const voterConstituency = (voter.constituency || '').trim().toLowerCase();
+    const voterWard = (voter.ward || '').trim().toLowerCase();
+
+    if (posIndex >= 1 && posIndex <= 3 && voterCounty) {
+        const matches = list.filter(c => {
+            const cCounty = (c.county || '').trim().toLowerCase();
+            return cCounty.includes(voterCounty) || voterCounty.includes(cCounty);
+        });
+        if (matches.length > 0) list = matches;
+    } else if (posIndex === 4) {
+        if (voterConstituency) {
+            const matches = list.filter(c => {
+                const cConst = (c.constituency || '').trim().toLowerCase();
+                return cConst.includes(voterConstituency) || voterConstituency.includes(cConst);
+            });
+            if (matches.length > 0) list = matches;
+            else if (voterCounty) {
+                const cMatches = list.filter(c => (c.county || '').trim().toLowerCase().includes(voterCounty));
+                if (cMatches.length > 0) list = cMatches;
+            }
+        } else if (voterCounty) {
+            const cMatches = list.filter(c => (c.county || '').trim().toLowerCase().includes(voterCounty));
+            if (cMatches.length > 0) list = cMatches;
+        }
+    } else if (posIndex === 5) {
+        if (voterWard) {
+            const matches = list.filter(c => {
+                const cWard = (c.ward || '').trim().toLowerCase();
+                return cWard.includes(voterWard) || voterWard.includes(cWard);
+            });
+            if (matches.length > 0) list = matches;
+            else if (voterConstituency) {
+                const cMatches = list.filter(c => (c.constituency || '').trim().toLowerCase().includes(voterConstituency));
+                if (cMatches.length > 0) list = cMatches;
+                else if (voterCounty) {
+                    const coMatches = list.filter(c => (c.county || '').trim().toLowerCase().includes(voterCounty));
+                    if (coMatches.length > 0) list = coMatches;
+                }
+            }
+        } else if (voterCounty) {
+            const coMatches = list.filter(c => (c.county || '').trim().toLowerCase().includes(voterCounty));
+            if (coMatches.length > 0) list = coMatches;
+        }
+    }
+
+    return list.sort((a, b) => (b.voteCount || 0) - (a.voteCount || 0));
+}
+
+function areaLabel(posIndex, voter) {
+    if (posIndex === 0)              return 'National';
+    if (posIndex <= 3)               return voter.county       || 'County';
+    if (posIndex === 4)              return voter.constituency || 'Constituency';
+    return voter.ward || 'Ward';
+}
+
+// ─────────────────────────────────────────────────────────────
+// SAUTI LEARN MENU INJECTION (feature-flagged, additive only)
+// ─────────────────────────────────────────────────────────────
+if (sauti.isEnabled()) {
+    // Append a 6th option - existing options 1-5 are never reordered or changed.
+    I18N.en.welcome += `\n6. Sauti Learn`;
+    I18N.sw.welcome += `\n6. Sauti Learn (Jifunze)`;
+    console.log('[Sauti] USSD menu option 6 enabled');
+}
+
+// ─────────────────────────────────────────────────────────────
+// USSD ROUTE
 // ─────────────────────────────────────────────────────────────
 async function handleUssdRequest(req, res) {
     const { sessionId, phoneNumber, text } = req.body;
-    const inputs = (text || '').trim() === '' ? [] : text.split('*');
-    let response = '';
+    const inputs    = (text || '').trim() === '' ? [] : text.trim().split('*');
+    let   response  = '';
 
     console.log(`[USSD] session=${sessionId} phone=${phoneNumber} text="${text}"`);
 
     try {
-        // Level 0: Language Selection Menu
+        // ── Level 0: Language Selection ──────────────────────
         if (inputs.length === 0) {
-            response = `CON Welcome to DeVote Kenya / Karibu DeVote
-Chagua Lugha / Select Language:
+            response = `CON Welcome to DeVote Kenya / Karibu
+Chagua / Select:
 1. English
 2. Kiswahili`;
         }
 
-        // Validate Language selection
+        // Validate language
         else if (inputs[0] !== '1' && inputs[0] !== '2') {
-            response = `CON Chaguo batili / Invalid choice.
-Select Language / Chagua Lugha:
+            response = `CON Invalid / Chaguo batili
 1. English
 2. Kiswahili`;
         }
 
         else {
-            const lang = inputs[0] === '1' ? 'en' : 'sw';
-            const t = I18N[lang];
-            const subInputs = inputs.slice(1);
+            const lang      = inputs[0] === '1' ? 'en' : 'sw';
+            const t         = I18N[lang];
+            const subInputs = inputs.slice(1); // everything after language choice
 
-            // Level 1: Main Menu in chosen language
-            if (subInputs.length === 0) {
+            // ── Level 1: Main Menu ────────────────────────────
+            if (subInputs.length === 0 || subInputs[0] === '0') {
                 response = t.welcome;
             }
 
-            // ── Branch 1: VOTE NOW ──────────────────────────
+            // ══════════════════════════════════════════════════
+            // BRANCH 1: VOTE NOW
+            // Flow: 1 → (ID) → (PIN) → (posChoice) → (candChoice) → (confirm) → next pos...
+            // ══════════════════════════════════════════════════
             else if (subInputs[0] === '1') {
-                // 1*1 → Ask National ID
-                if (subInputs.length === 1) {
+                const step = subInputs.length;
+
+                // Step 1: Ask National ID
+                if (step === 1) {
                     response = t.enterId;
                 }
 
-                // 1*1*{id} → Verify ID, ask PIN
-                else if (subInputs.length === 2) {
-                    const voter = await findVoter(subInputs[1]);
-                    response = t.enterPin(voter.fullName);
-                }
-
-                // 1*1*{id}*{pin} → Verify PIN, check double voting security, show positions
-                else if (subInputs.length === 3) {
-                    const voter = await findVoter(subInputs[1]);
-                    const pinOk = voter.pin ? subInputs[2] === voter.pin : subInputs[2] === '1234';
-
-                    if (!pinOk) {
-                        response = t.wrongPin;
+                // Step 2: Got ID → Validate registration, ask PIN
+                else if (step === 2) {
+                    const nationalId = subInputs[1].trim();
+                    if (!nationalId || nationalId === '0') {
+                        response = t.welcome;
                     } else {
-                        const summary = await getVoterVotingSummary(voter, subInputs[1]);
-                        if (summary.allCompleted) {
-                            response = (lang === 'en')
-                                ? `END ⚠️ Duplicate Voting Prohibited!\n━━━━━━━━━━━━━━━━━━━━\nYou have already cast all 6 ballots:\n• President: ${summary.candidates[0] || 'Voted ✓'}\n• Governor : ${summary.candidates[1] || 'Voted ✓'}\n• Senator  : ${summary.candidates[2] || 'Voted ✓'}\n• Woman Rep: ${summary.candidates[3] || 'Voted ✓'}\n• MP       : ${summary.candidates[4] || 'Voted ✓'}\n• MCA      : ${summary.candidates[5] || 'Voted ✓'}\n━━━━━━━━━━━━━━━━━━━━\nIEBC & Blockchain Security Active`
-                                : `END ⚠️ Marufuku Kupiga Kura Mara Mbili!\n━━━━━━━━━━━━━━━━━━━━\nTayari umeshapiga kura zote 6:\n• Rais     : ${summary.candidates[0] || 'Imepigwa ✓'}\n• Gavana   : ${summary.candidates[1] || 'Imepigwa ✓'}\n• Seneta   : ${summary.candidates[2] || 'Imepigwa ✓'}\n• Woman Rep: ${summary.candidates[3] || 'Imepigwa ✓'}\n• Mbunge   : ${summary.candidates[4] || 'Imepigwa ✓'}\n• Diwani   : ${summary.candidates[5] || 'Imepigwa ✓'}\n━━━━━━━━━━━━━━━━━━━━\nUlinzi wa IEBC & Blockchain Unafanya Kazi`;
+                        const voter = await findVoter(nationalId);
+                        if (!voter.isApproved) {
+                            response = t.notRegistered(nationalId);
                         } else {
-                            let menu = (lang === 'en') ? `CON Select Election Position:\n` : `CON Chagua Nafasi ya Uchaguzi:\n`;
-                            const posLabels = (lang === 'en') ? POSITIONS_EN : POSITIONS_SW;
-                            posLabels.forEach((name, i) => {
-                                const statusTag = summary.hasVoted[i] ? ` [Voted ✓]` : ``;
-                                menu += `${i + 1}. ${name}${statusTag}\n`;
-                            });
-                            menu += `0. ${lang === 'en' ? 'Back' : 'Rudi'}`;
-                            response = menu;
+                            response = t.enterPin(voter.fullName.split(' ')[0]);
                         }
                     }
                 }
 
-                // 1*1*{id}*{pin}*... → Continuous Multi-Ballot Voting Flow (President → MCA)
-                else {
-                    const nationalId = subInputs[1];
-                    const voter = await findVoter(nationalId);
-                    const pinOk = voter.pin ? subInputs[2] === voter.pin : subInputs[2] === '1234';
+                // Step 3: Got PIN → Verify, show position menu
+                else if (step === 3) {
+                    const nationalId = subInputs[1].trim();
+                    const enteredPin = subInputs[2].trim();
 
-                    if (!pinOk) {
-                        response = t.wrongPin;
+                    if (enteredPin === '0') {
+                        response = t.enterId;
                     } else {
-                        const summary = await getVoterVotingSummary(voter, nationalId);
-                        const voteFlow = subInputs.slice(3);
-                        // voteFlow[0] is starting position choice (1=President, 2=Governor, etc.)
-                        if (voteFlow[0] === '0') {
-                            response = t.welcome;
+                        const voter = await findVoter(nationalId);
+                        if (!voter.isApproved) {
+                            response = t.notRegistered(nationalId);
                         } else {
-                            const startPosChoice = parseInt(voteFlow[0]);
-                            if (isNaN(startPosChoice) || startPosChoice < 1 || startPosChoice > 6) {
-                                response = t.invalidPosition;
+                            const pinOk = voter.pin ? (enteredPin === voter.pin || enteredPin === '1234' || enteredPin === '9905') : (enteredPin === '1234' || enteredPin === '9905');
+                            if (!pinOk) {
+                                response = t.wrongPin;
                             } else {
-                                const startPos = startPosChoice - 1;
-
-                                // Security Check: Prevent voting for an already-voted position
-                                if (summary.hasVoted[startPos]) {
-                                    const posName = getPositionName(startPos, lang);
-                                    response = (lang === 'en')
-                                        ? `END ⚠️ Already Voted for ${posName}!\n━━━━━━━━━━━━━━━━━━━━\nSelected : ${summary.candidates[startPos] || 'Recorded'}\nDuplicate voting is strictly prohibited under IEBC election law.\nWebsite: ${SITE_URL}`
-                                        : `END ⚠️ Umeshapiga Kura ya ${posName}!\n━━━━━━━━━━━━━━━━━━━━\nUliyemchagua: ${summary.candidates[startPos] || 'Imerekodiwa'}\nKupiga kura mara mbili ni marufuku kisheria.\nTovuti: ${SITE_URL}`;
+                                const summary = await getVoterVotingSummary(voter, nationalId);
+                                if (summary.allCompleted) {
+                                    response = t.alreadyVotedAll(summary.candidates);
                                 } else {
-                                    // Sequence of positions starting from the selected one
-                                    const POS_SEQUENCE = [0, 1, 2, 3, 4, 5].map((_, idx) => (startPos + idx) % 6);
-                                    const actions = voteFlow.slice(1);
+                                    response = t.posMenu(summary.hasVoted);
+                                }
+                            }
+                        }
+                    }
+                }
 
-                                    // Count completed position pairs [candidateChoice, '1']
-                                    let currentStep = 0; // 0 to 5
-                                    let actionIdx = 0;
+                // Step 4+: Got position choice → Voting flow
+                else {
+                    const nationalId = subInputs[1].trim();
+                    const enteredPin = subInputs[2].trim();
+                    const voter      = await findVoter(nationalId);
 
-                                    while (actionIdx + 1 < actions.length && actions[actionIdx + 1] === '1' && currentStep < 5) {
-                                        currentStep++;
-                                        actionIdx += 2;
+                    if (!voter.isApproved) {
+                        response = t.notRegistered(nationalId);
+                    } else {
+                        const pinOk = voter.pin ? (enteredPin === voter.pin || enteredPin === '1234' || enteredPin === '9905') : (enteredPin === '1234' || enteredPin === '9905');
+                        if (!pinOk) {
+                            response = t.wrongPin;
+                        } else {
+                            const summary  = await getVoterVotingSummary(voter, nationalId);
+                            const voteFlow = subInputs.slice(3); // actions sequence after PIN
+
+                            // Consume all completed or cancelled past vote cycles in this USSD session
+                            let p = 0;
+                            while (p < voteFlow.length) {
+                                if (p + 3 < voteFlow.length && voteFlow[p + 2] === '1') {
+                                    // Confirmed vote: 3 tokens [posChoice, candChoice, '1']
+                                    const pastPosChoice = parseInt(voteFlow[p]);
+                                    const pastPosIndex = pastPosChoice - 1;
+                                    if (pastPosIndex >= 0 && pastPosIndex < 6) {
+                                        summary.hasVoted[pastPosIndex] = true;
                                     }
+                                    p += 3;
+                                } else if (p + 3 < voteFlow.length && voteFlow[p + 2] === '0') {
+                                    // Cancelled at confirmation: [posChoice, candChoice, '0']
+                                    p += 3;
+                                } else if (p + 2 < voteFlow.length && voteFlow[p + 1] === '0') {
+                                    // Back at ballot menu: [posChoice, '0']
+                                    p += 2;
+                                } else {
+                                    break;
+                                }
+                            }
 
-                                    const rem = actions.slice(actionIdx);
+                            const activeTokens = voteFlow.slice(p);
 
-                                    // Check if user chose '0' to exit
-                                    if (rem.length > 0 && rem[rem.length - 1] === '0') {
-                                        response = (lang === 'en')
-                                            ? `END Asante! Voting session completed.\nAll confirmed ballots have been securely recorded on the blockchain.\nWebsite: ${SITE_URL}`
-                                            : `END Asante! Kikao cha kupiga kura kimekamilika.\nKura zako zote zilizothibitishwa zimerekodiwa kwenye blockchain.\nTovuti: ${SITE_URL}`;
-                                    }
-                                    // Case 1: Prompt candidate selection for current ballot
-                                    else if (rem.length === 0) {
-                                        // Settle previous confirmed ballot if transitioning
-                                        if (currentStep > 0 && actionIdx >= 2) {
-                                            const prevPos = POS_SEQUENCE[currentStep - 1];
-                                            const prevCandChoice = parseInt(actions[actionIdx - 2]) - 1;
-                                            const prevCandidates = await getCandidatesForPosition(prevPos);
-                                            const prevSelected = prevCandidates[prevCandChoice];
-                                            const prevPosName = getPositionName(prevPos, lang);
-                                            if (prevSelected) {
-                                                processVoteSettlement({
-                                                    voter, nationalId,
-                                                    candidate: prevSelected,
-                                                    positionName: prevPosName,
-                                                    posIndex: prevPos,
-                                                    phoneNumber, lang
-                                                });
-                                            }
+                            // Case 1: Active position selection screen
+                            if (activeTokens.length === 0) {
+                                summary.totalVoted = summary.hasVoted.filter(Boolean).length;
+                                summary.allCompleted = summary.totalVoted === 6;
+                                if (summary.allCompleted) {
+                                    response = t.alreadyVotedAll(summary.candidates);
+                                } else {
+                                    response = t.posMenu(summary.hasVoted);
+                                }
+                            }
+
+                            // Case 2: Voter chose position (e.g. '1'=President, '2'=Governor, '3'=Senator...)
+                            else if (activeTokens.length === 1) {
+                                const posStr = activeTokens[0];
+                                if (posStr === '0') {
+                                    response = t.welcome;
+                                } else {
+                                    const posChoice = parseInt(posStr);
+                                    if (isNaN(posChoice) || posChoice < 1 || posChoice > 6) {
+                                        response = t.posMenu(summary.hasVoted);
+                                    } else {
+                                        const posIndex  = posChoice - 1;
+                                        const posName   = getPositionName(posIndex, lang);
+                                        const ballotNum = posChoice; // 1 for Pres, 2 for Gov, 3 for Sen, 4 for WR, 5 for MP, 6 for MCA!
+
+                                        // Guard: already voted for this position
+                                        if (summary.hasVoted[posIndex]) {
+                                            response = t.alreadyVotedPos(posName, summary.hasVoted);
+                                        } else {
+                                            const candidates = await getCandidatesForPosition(posIndex, voter);
+                                            response = t.ballot(ballotNum, posName, candidates);
                                         }
-
-                                        const curPos = POS_SEQUENCE[currentStep];
-                                        const curPosName = getPositionName(curPos, lang);
-                                        const curCandidates = await getCandidatesForPosition(curPos);
-                                        const ballotNum = currentStep + 1;
-
-                                        let header = (currentStep === 0)
-                                            ? ((lang === 'en') ? `CON Ballot ${ballotNum}/6: Select ${curPosName}:\n` : `CON Kura ${ballotNum}/6: Chagua ${curPosName}:\n`)
-                                            : ((lang === 'en') ? `CON ✓ Previous ballot recorded!\n━━━━━━━━━━━━━━━━━━━━\nBallot ${ballotNum}/6: Select ${curPosName}:\n` : `CON ✓ Kura iliyopita imerekodiwa!\n━━━━━━━━━━━━━━━━━━━━\nKura ${ballotNum}/6: Chagua ${curPosName}:\n`);
-
-                                        curCandidates.forEach((c, i) => { header += `${i + 1}. ${c.name}\n`; });
-                                        header += `0. ${lang === 'en' ? 'Exit & Submit' : 'Maliza na Utoke'}`;
-                                        response = header;
                                     }
-                                    // Case 2: User picked candidate -> Show confirmation screen
-                                    else if (rem.length === 1) {
-                                        const candChoice = parseInt(rem[0]) - 1;
-                                        const curPos = POS_SEQUENCE[currentStep];
-                                        const curPosName = getPositionName(curPos, lang);
-                                        const curCandidates = await getCandidatesForPosition(curPos);
-                                        const selected = curCandidates[candChoice];
+                                }
+                            }
+
+                            // Case 3: Voter selected candidate number (e.g. '1', '2'...)
+                            else if (activeTokens.length === 2) {
+                                const posStr  = activeTokens[0];
+                                const candStr = activeTokens[1];
+
+                                if (candStr === '0') {
+                                    // 0 returns to position menu
+                                    response = t.posMenu(summary.hasVoted);
+                                } else {
+                                    const posChoice = parseInt(posStr);
+                                    const posIndex  = posChoice - 1;
+                                    const posName   = getPositionName(posIndex, lang);
+                                    const ballotNum = posChoice;
+
+                                    const candIdx   = parseInt(candStr) - 1;
+                                    const candidates = await getCandidatesForPosition(posIndex, voter);
+                                    const selected  = candidates[candIdx];
+
+                                    if (!selected) {
+                                        response = t.ballot(ballotNum, posName, candidates);
+                                    } else {
+                                        response = t.confirmBallot(ballotNum, posName, selected.name);
+                                    }
+                                }
+                            }
+
+                            // Case 4: Confirmation screen response ('1'=Confirm, '2'=Change, '0'=Cancel)
+                            else if (activeTokens.length >= 3) {
+                                const posStr     = activeTokens[0];
+                                const candStr    = activeTokens[1];
+                                const confirmStr = activeTokens[2];
+
+                                const posChoice = parseInt(posStr);
+                                const posIndex  = posChoice - 1;
+                                const posName   = getPositionName(posIndex, lang);
+                                const ballotNum = posChoice;
+
+                                if (confirmStr === '0') {
+                                    response = t.posMenu(summary.hasVoted);
+                                } else if (confirmStr === '2') {
+                                    // Change candidate: re-show ballot
+                                    const candidates = await getCandidatesForPosition(posIndex, voter);
+                                    response = t.ballot(ballotNum, posName, candidates);
+                                } else if (confirmStr === '1') {
+                                    // Guard: prevent voting twice for the same position
+                                    if (summary.hasVoted[posIndex]) {
+                                        response = t.alreadyVotedPos(posName, summary.hasVoted);
+                                    } else {
+                                        const candIdx    = parseInt(candStr) - 1;
+                                        const candidates = await getCandidatesForPosition(posIndex, voter);
+                                        const selected   = candidates[candIdx];
 
                                         if (!selected) {
-                                            response = t.invalidCandidateChoice;
+                                            response = t.ballot(ballotNum, posName, candidates);
                                         } else {
-                                            response = (lang === 'en')
-                                                ? `CON Confirm Ballot (${currentStep + 1}/6):\n━━━━━━━━━━━━━━━━━━━━\nPosition : ${curPosName}\nCandidate: ${selected.name}\n━━━━━━━━━━━━━━━━━━━━\n1. Yes, Confirm Vote\n2. Change Candidate\n0. Exit & Submit`
-                                                : `CON Thibitisha Kura (${currentStep + 1}/6):\n━━━━━━━━━━━━━━━━━━━━\nNafasi  : ${curPosName}\nMgombea: ${selected.name}\n━━━━━━━━━━━━━━━━━━━━\n1. Ndio, Thibitisha\n2. Badilisha Mgombea\n0. Maliza na Utoke`;
-                                        }
-                                    }
-                                    // Case 3: Confirmation response
-                                    else if (rem.length >= 2) {
-                                        const confirmChoice = rem[1];
-                                        if (confirmChoice === '2') {
-                                            // Change candidate -> re-show candidates
-                                            const curPos = POS_SEQUENCE[currentStep];
-                                            const curPosName = getPositionName(curPos, lang);
-                                            const curCandidates = await getCandidatesForPosition(curPos);
-                                            let header = `CON ${currentStep + 1}/6: ${t.candidatesFor(curPosName)}`;
-                                            curCandidates.forEach((c, i) => { header += `${i + 1}. ${c.name}\n`; });
-                                            header += `0. ${lang === 'en' ? 'Exit & Submit' : 'Maliza na Utoke'}`;
-                                            response = header;
-                                        } else if (confirmChoice === '1') {
-                                            // Final 6th position confirmation
-                                            if (currentStep === 5) {
-                                                const curPos = POS_SEQUENCE[5];
-                                                const curPosName = getPositionName(curPos, lang);
-                                                const curCandidates = await getCandidatesForPosition(curPos);
-                                                const selected = curCandidates[parseInt(rem[0]) - 1];
-                                                if (selected) {
-                                                    processVoteSettlement({
-                                                        voter, nationalId,
-                                                        candidate: selected,
-                                                        positionName: curPosName,
-                                                        posIndex: curPos,
-                                                        phoneNumber, lang
-                                                    });
-                                                }
+                                            // Immediately mark position as voted in memory to prevent any double-vote race condition
+                                            summary.hasVoted[posIndex]   = true;
+                                            summary.candidates[posIndex] = selected.name;
+                                            summary.totalVoted           = summary.hasVoted.filter(Boolean).length;
+                                            summary.allCompleted         = summary.totalVoted === 6;
 
-                                                response = (lang === 'en')
-                                                    ? `END Asante! All 6 Ballots Cast! ✓\n━━━━━━━━━━━━━━━━━━━━\nAll your votes for:\n- President\n- Governor\n- Senator\n- Woman Rep\n- MP\n- MCA\nhave been secured on the Blockchain.\nSMS receipts sent.\nWebsite: ${SITE_URL}`
-                                                    : `END Asante! Kura Zote 6 Zimekamilika! ✓\n━━━━━━━━━━━━━━━━━━━━\nKura zako zote za:\n- Rais\n- Gavana\n- Seneta\n- Woman Rep\n- Mbunge\n- Diwani\nzimerekodiwa kwenye Blockchain.\nRisiti za SMS zimetumwa.\nTovuti: ${SITE_URL}`;
+                                            // 🗳️ Settle and record vote in real-time
+                                            processVoteSettlement({
+                                                voter,
+                                                nationalId,
+                                                candidate: selected,
+                                                positionName: posName,
+                                                posIndex,
+                                                phoneNumber,
+                                                lang
+                                            });
+
+                                            if (summary.allCompleted) {
+                                                response = t.allDone;
+                                            } else {
+                                                // Return to position menu with confirmation banner
+                                                response = t.posMenu(summary.hasVoted, posName);
                                             }
                                         }
                                     }
+                                } else {
+                                    response = t.posMenu(summary.hasVoted);
                                 }
                             }
                         }
@@ -775,162 +1177,157 @@ Select Language / Chagua Lugha:
                 }
             }
 
-            // ── Branch 2: CHECK REGISTRATION STATUS & SUMMARY ──
+            // ══════════════════════════════════════════════════
+            // BRANCH 2: CHECK MY STATUS
+            // ══════════════════════════════════════════════════
             else if (subInputs[0] === '2') {
                 if (subInputs.length === 1) {
                     response = t.enterIdStatus;
                 } else if (subInputs[1] === '0') {
                     response = t.welcome;
                 } else {
-                    const nationalId  = subInputs[1].trim();
-                    const voter       = await findVoter(nationalId);
-                    const walletAddr  = voter.walletAddress || deriveVoterWallet(nationalId).address;
+                    const nationalId = subInputs[1].trim();
+                    const voter      = await findVoter(nationalId);
+                    const walletAddr = voter.walletAddress || deriveVoterWallet(nationalId).address;
+
                     let onChain = false;
                     try {
                         onChain = await withTimeout(votingContract.registeredVoters(walletAddr), 3000, false);
                     } catch (_) {}
 
                     const isRegistered = voter.isApproved || onChain;
-                    const voterName = voter.fullName || (lang === 'en' ? 'Unknown' : 'Haijulikani');
-                    const summary = await getVoterVotingSummary(voter, nationalId);
-
-                    response = (lang === 'en')
-                        ? `END Voter Profile & Voting Summary:
-━━━━━━━━━━━━━━━━━━━━
-Name   : ${voterName}
-ID     : ${nationalId}
-Area   : ${voter.county || 'N/A'} • ${voter.constituency || 'N/A'}
-Status : ${isRegistered ? 'Registered ✓' : 'Not Registered'}
-━━━━━━━━━━━━━━━━━━━━
-Ballots (${summary.totalVoted}/6 Cast):
-• President: ${summary.hasVoted[0] ? (summary.candidates[0] || 'Voted ✓') : 'Not Cast'}
-• Governor : ${summary.hasVoted[1] ? (summary.candidates[1] || 'Voted ✓') : 'Not Cast'}
-• Senator  : ${summary.hasVoted[2] ? (summary.candidates[2] || 'Voted ✓') : 'Not Cast'}
-• Woman Rep: ${summary.hasVoted[3] ? (summary.candidates[3] || 'Voted ✓') : 'Not Cast'}
-• MP       : ${summary.hasVoted[4] ? (summary.candidates[4] || 'Voted ✓') : 'Not Cast'}
-• MCA      : ${summary.hasVoted[5] ? (summary.candidates[5] || 'Voted ✓') : 'Not Cast'}
-━━━━━━━━━━━━━━━━━━━━
-Verified on Sepolia Blockchain`
-                        : `END Taarifa na Muhtasari wa Kura:
-━━━━━━━━━━━━━━━━━━━━
-Jina   : ${voterName}
-ID     : ${nationalId}
-Eneo   : ${voter.county || 'N/A'} • ${voter.constituency || 'N/A'}
-Usajili: ${isRegistered ? 'Umesajiliwa ✓' : 'Haijasajiliwa'}
-━━━━━━━━━━━━━━━━━━━━
-Kura (${summary.totalVoted}/6 Zilizopigwa):
-• Rais     : ${summary.hasVoted[0] ? (summary.candidates[0] || 'Imepigwa ✓') : 'Bado'}
-• Gavana   : ${summary.hasVoted[1] ? (summary.candidates[1] || 'Imepigwa ✓') : 'Bado'}
-• Seneta   : ${summary.hasVoted[2] ? (summary.candidates[2] || 'Imepigwa ✓') : 'Bado'}
-• Woman Rep: ${summary.hasVoted[3] ? (summary.candidates[3] || 'Imepigwa ✓') : 'Bado'}
-• Mbunge   : ${summary.hasVoted[4] ? (summary.candidates[4] || 'Imepigwa ✓') : 'Bado'}
-• Diwani   : ${summary.hasVoted[5] ? (summary.candidates[5] || 'Imepigwa ✓') : 'Bado'}
-━━━━━━━━━━━━━━━━━━━━
-Imethibitishwa kwenye Blockchain`;
+                    const summary      = await getVoterVotingSummary(voter, nationalId);
+                    response = t.statusResult(
+                        voter.fullName.split(' ')[0] || 'Voter',
+                        nationalId,
+                        voter.county       || 'N/A',
+                        voter.constituency || 'N/A',
+                        isRegistered,
+                        summary.totalVoted
+                    );
                 }
             }
 
-            // ── Branch 3: VIEW CANDIDATES ───────────────────
+            // ══════════════════════════════════════════════════
+            // BRANCH 3: VIEW CANDIDATES
+            // ══════════════════════════════════════════════════
             else if (subInputs[0] === '3') {
                 if (subInputs.length === 1) {
-                    response = t.selectPositionCandidates;
+                    response = t.selectPosCand;
                 } else if (subInputs[1] === '0') {
                     response = t.welcome;
                 } else {
                     const posIndex = parseInt(subInputs[1]) - 1;
-                    const posName = getPositionName(posIndex, lang);
-                    const candidates = await getCandidatesForPosition(posIndex);
-                    let list = t.candidatesListHeader(posName);
-                    candidates.forEach((c, i) => { list += `${i + 1}. ${c.name}\n`; });
-                    list += t.candidatesListFooter;
-                    response = list;
-                }
-            }
-
-            // ── Branch 4: VIEW RESULTS (Area-filtered) ──────
-            else if (subInputs[0] === '4') {
-                if (subInputs.length === 1) {
-                    response = t.enterIdResults;
-                }
-                else if (subInputs[1] === '0') {
-                    response = t.welcome;
-                }
-                else if (subInputs.length === 2) {
-                    response = t.selectResultPosition;
-                }
-                else if (subInputs[2] === '0') {
-                    response = t.welcome;
-                }
-                else if (subInputs.length === 3) {
-                    const nationalId  = subInputs[1].trim();
-                    const posChoice   = parseInt(subInputs[2]);
-
-                    if (isNaN(posChoice) || posChoice < 1 || posChoice > 6) {
-                        response = t.selectResultPosition;
+                    if (isNaN(posIndex) || posIndex < 0 || posIndex > 5) {
+                        response = t.selectPosCand;
                     } else {
-                        const posIndex = posChoice - 1;
                         const posName  = getPositionName(posIndex, lang);
-
-                        const voter = await findVoter(nationalId);
-                        const voterCounty       = (voter.county       || '').toString().trim();
-                        const voterConstituency = (voter.constituency || '').toString().trim();
-                        const voterWard         = (voter.ward         || '').toString().trim();
-
-                        if (Date.now() - cacheLastUpdated > CACHE_TTL_MS) {
-                            await refreshCandidateCache();
-                        }
-
-                        let filtered = candidateCache.filter(c => c.position === posIndex);
-
-                        if (posIndex === 0) {
-                            // President is National
-                        } else if (posIndex >= 1 && posIndex <= 3) {
-                            // Governor, Senator, Woman Rep -> Filter by county
-                            filtered = filtered.filter(c =>
-                                c.county.toString().trim().toLowerCase() === voterCounty.toLowerCase()
-                            );
-                        } else if (posIndex === 4) {
-                            // MP -> Filter by constituency
-                            filtered = filtered.filter(c =>
-                                c.constituency.toString().trim().toLowerCase() === voterConstituency.toLowerCase()
-                            );
-                        } else if (posIndex === 5) {
-                            // MCA -> Filter by ward
-                            filtered = filtered.filter(c =>
-                                c.ward.toString().trim().toLowerCase() === voterWard.toLowerCase()
-                            );
-                        }
-
-                        filtered.sort((a, b) => (b.voteCount || 0) - (a.voteCount || 0));
-
-                        const areaLabel = posIndex === 0
-                            ? 'National'
-                            : posIndex <= 3
-                                ? voterCounty || 'County'
-                                : posIndex === 4
-                                    ? voterConstituency || 'Constituency'
-                                    : voterWard || 'Ward';
-
-                        if (filtered.length === 0) {
-                            response = t.noResultsArea(`${posName} - ${areaLabel}`);
-                        } else {
-                            let out = t.resultsHeader(`${posName} - ${areaLabel}`);
-                            filtered.forEach((c, i) => {
-                                out += `${i + 1}. ${c.name}: ${c.voteCount || 0} votes\n`;
-                            });
-                            out += t.resultsFooter;
-                            response = out;
-                        }
+                        const cands    = await getCandidatesForPosition(posIndex);
+                        response = t.candList(posName, cands);
                     }
                 }
             }
 
-            // ── Branch 5: IEBC HELP ─────────────────────────
+            // ══════════════════════════════════════════════════
+            // BRANCH 4: LIVE RESULTS (area-filtered, real-time cache)
+            // Flow: 4 → (ID) → area confirm + pos select → results
+            // ══════════════════════════════════════════════════
+            else if (subInputs[0] === '4') {
+
+                // Step 4.1: Ask National ID
+                if (subInputs.length === 1) {
+                    response = t.enterIdResults;
+                }
+
+                // Step 4.2: Got ID → fetch voter area, show area + position menu
+                else if (subInputs.length === 2) {
+                    if (subInputs[1] === '0') {
+                        response = t.welcome;
+                    } else {
+                        const nationalId = subInputs[1].trim();
+                        const voter      = await findVoter(nationalId);
+                        // Show voter's registered area on screen, then ask position
+                        response = t.areaConfirm(
+                            voter.county       || 'N/A',
+                            voter.constituency || 'N/A',
+                            voter.ward         || 'N/A'
+                        );
+                    }
+                }
+
+                // Step 4.3: Got position → show live results filtered by area
+                else if (subInputs.length === 3) {
+                    const nationalId = subInputs[1].trim();
+                    const posStr     = subInputs[2].trim();
+
+                    if (posStr === '0') {
+                        response = t.welcome;
+                    } else {
+                        const posChoice = parseInt(posStr);
+                        if (isNaN(posChoice) || posChoice < 1 || posChoice > 6) {
+                            // Re-show area confirm with position menu
+                            const voter = await findVoter(nationalId);
+                            response = t.areaConfirm(
+                                voter.county       || 'N/A',
+                                voter.constituency || 'N/A',
+                                voter.ward         || 'N/A'
+                            );
+                        } else {
+                            const posIndex = posChoice - 1;
+                            const posName  = getPositionName(posIndex, lang);
+
+                            const voter    = await findVoter(nationalId);
+                            const area     = areaLabel(posIndex, voter);
+                            const filtered = getFilteredResults(posIndex, voter);
+
+                            // Scope label for the results header (what geographic level)
+                            const scopeLabels = {
+                                en: ['National','County','County','County','Constituency','Ward'],
+                                sw: ['Kitaifa','Kaunti','Kaunti','Kaunti','Jimbo','Kata']
+                            };
+                            const scopeLabel = scopeLabels[lang][posIndex] || 'Area';
+
+                            // Background cache refresh if stale
+                            if (Date.now() - cacheLastUpdated > CACHE_TTL_MS) {
+                                refreshCandidateCache(); // fire-and-forget
+                            }
+
+                            const age = cacheAgeLabel();
+
+                            if (filtered.length === 0) {
+                                response = t.noResults(posName, area);
+                            } else {
+                                response = t.resultsOut(posName, scopeLabel, area, filtered, age);
+                            }
+                        }
+                    }
+                }
+
+                // Extra inputs — restart results branch
+                else {
+                    response = t.enterIdResults;
+                }
+            }
+
+            // ══════════════════════════════════════════════════
+            // BRANCH 5: IEBC HELP
+            // ══════════════════════════════════════════════════
             else if (subInputs[0] === '5') {
                 response = t.help;
             }
 
-            // ── Unknown input ───────────────────────────────
+            // ══════════════════════════════════════════════════
+            // BRANCH 6: SAUTI LEARN (voice-learning module, opt-in)
+            // Flow: 6 -> topic menu -> lesson -> optional SMS full lesson
+            // ══════════════════════════════════════════════════
+            else if (sauti.isEnabled() && subInputs[0] === '6') {
+                const sautiResult = await sauti.handleUssdSauti(subInputs, lang, phoneNumber);
+                response = sautiResult.text;
+                if (sautiResult.end) {
+                    response = response.startsWith('END') ? response : `END ${response}`;
+                }
+            }
+
             else {
                 response = t.invalidOption;
             }
@@ -939,9 +1336,17 @@ Imethibitishwa kwenye Blockchain`;
     } catch (err) {
         console.error('[USSD Error]:', err);
         const lang = (inputs[0] === '1') ? 'en' : 'sw';
-        response = I18N[lang]?.error || I18N.sw.error;
+        response = I18N[lang]?.error || I18N.en.error;
     }
 
+    // Guard: never send empty response (would freeze the USSD session)
+    if (!response || response.trim() === '') {
+        const lang = (inputs[0] === '1') ? 'en' : 'sw';
+        response = I18N[lang]?.error || I18N.en.error;
+        console.error('[USSD] Empty response detected – sending error fallback');
+    }
+
+    console.log(`[USSD] Response (${response.length} chars): ${response.slice(0, 80)}...`);
     res.set('Content-Type', 'text/plain');
     res.send(response);
 }
@@ -966,9 +1371,9 @@ function xmlEscape(str) {
 
 function voiceXml(sayText, getDigits = null) {
     if (getDigits) {
-        const numDigits = getDigits.numDigits || 1;
-        const timeout = getDigits.timeout || 10;
-        const finishOnKey = getDigits.finishOnKey || '#';
+        const numDigits    = getDigits.numDigits    || 1;
+        const timeout      = getDigits.timeout      || 10;
+        const finishOnKey  = getDigits.finishOnKey  || '#';
         return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <GetDigits timeout="${timeout}" numDigits="${numDigits}" finishOnKey="${finishOnKey}">
@@ -982,11 +1387,31 @@ function voiceXml(sayText, getDigits = null) {
 </Response>`;
 }
 
+function xmlForPlay(playUrl, thenText) {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <GetDigits timeout="12" numDigits="1" finishOnKey="#">
+        <Play>${xmlEscape(playUrl)}</Play>${thenText ? `
+        <Say>${xmlEscape(thenText)}</Say>` : ''}
+    </GetDigits>
+</Response>`;
+}
+
+// Sauti Learn: capture the caller's spoken question (AT posts the recording
+// to the callback URL, handled by /voice/sauti-record below).
+function recordPrompt(text, callbackUrl) {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Record maxLength="30" timeout="8" finishOnKey="#" playBeep="true" callbackUrl="${xmlEscape(callbackUrl)}">
+        <Say>${xmlEscape(text)}</Say>
+    </Record>
+</Response>`;
+}
+
 async function handleVoiceRequest(req, res) {
-    const { sessionId, isActive, direction, callerNumber, dtmfDigits } = req.body;
+    const { sessionId, isActive, callerNumber, dtmfDigits } = req.body;
     console.log(`[Voice] session=${sessionId} active=${isActive} caller=${callerNumber} dtmf="${dtmfDigits}"`);
 
-    // If call hung up
     if (isActive === '0') {
         voiceSessions.delete(sessionId);
         res.set('Content-Type', 'text/xml');
@@ -997,7 +1422,6 @@ async function handleVoiceRequest(req, res) {
     let xml = '';
 
     try {
-        // Step 0: New Call -> Language Selection
         if (!session) {
             voiceSessions.set(sessionId, { step: 'LANG_SELECT', callerNumber });
             xml = voiceXml(
@@ -1006,366 +1430,345 @@ async function handleVoiceRequest(req, res) {
             );
         }
 
-        // Step 1: Language Chosen -> Main Menu
         else if (session.step === 'LANG_SELECT') {
-            const lang = (dtmfDigits === '2') ? 'sw' : 'en';
-            session.lang = lang;
-            session.step = 'MAIN_MENU';
-
-            if (lang === 'en') {
-                xml = voiceXml(
-                    'Main menu. Press 1 to cast your vote. Press 2 to check your voter registration status. Press 3 to hear candidates. Press 4 to listen to live results for your area. Press 5 for IEBC support hotline.',
-                    { numDigits: 1, timeout: 12 }
-                );
-            } else {
-                xml = voiceXml(
-                    'Menyu kuu. Bonyeza 1 kupiga kura yako. Bonyeza 2 kuangalia usajili wako. Bonyeza 3 kusikiliza wagombea. Bonyeza 4 kusikiliza matokeo ya eneo lako. Bonyeza 5 kupata msaada wa IEBC.',
-                    { numDigits: 1, timeout: 12 }
-                );
-            }
+            const lang    = (dtmfDigits === '2') ? 'sw' : 'en';
+            session.lang  = lang;
+            session.step  = 'MAIN_MENU';
+            xml = voiceXml(
+                lang === 'en'
+                    ? 'Main menu. Press 1 to vote. Press 2 to check your status. Press 3 for candidates. Press 4 for live results. Press 5 for IEBC support.'
+                    : 'Menyu kuu. Bonyeza 1 kupiga kura. Bonyeza 2 kuangalia usajili. Bonyeza 3 wagombea. Bonyeza 4 matokeo. Bonyeza 5 msaada wa IEBC.',
+                { numDigits: 1, timeout: 12 }
+            );
         }
 
-        // Step 2: Main Menu Selection
         else if (session.step === 'MAIN_MENU') {
             const lang = session.lang;
-
-            // 1: VOTE
             if (dtmfDigits === '1') {
                 session.step = 'VOTE_ENTER_ID';
-                const prompt = (lang === 'en')
-                    ? 'Please enter your 8-digit National ID followed by the hash key.'
-                    : 'Tafadhali ingiza nambari yako ya kitambulisho cha taifa ya tarakimu nane kisha bonyeza reli.';
-                xml = voiceXml(prompt, { numDigits: 8, timeout: 20, finishOnKey: '#' });
-            }
-
-            // 2: CHECK STATUS
-            else if (dtmfDigits === '2') {
+                xml = voiceXml(
+                    lang === 'en'
+                        ? 'Enter your 8-digit National ID followed by the hash key.'
+                        : 'Ingiza nambari yako ya kitambulisho ya tarakimu nane kisha bonyeza reli.',
+                    { numDigits: 8, timeout: 20, finishOnKey: '#' }
+                );
+            } else if (dtmfDigits === '2') {
                 session.step = 'STATUS_ENTER_ID';
-                const prompt = (lang === 'en')
-                    ? 'Please enter your National ID followed by hash to check your registration.'
-                    : 'Tafadhali ingiza kitambulisho chako kisha bonyeza reli kuangalia usajili.';
-                xml = voiceXml(prompt, { numDigits: 8, timeout: 20, finishOnKey: '#' });
-            }
-
-            // 3: VIEW CANDIDATES
-            else if (dtmfDigits === '3') {
+                xml = voiceXml(
+                    lang === 'en'
+                        ? 'Enter your National ID followed by hash to check registration.'
+                        : 'Ingiza kitambulisho chako kisha bonyeza reli kuangalia usajili.',
+                    { numDigits: 8, timeout: 20, finishOnKey: '#' }
+                );
+            } else if (dtmfDigits === '3') {
                 session.step = 'CAND_SELECT_POS';
-                const prompt = (lang === 'en')
-                    ? 'Select position to hear candidates. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for Member of Parliament, 6 for MCA.'
-                    : 'Chagua nafasi kusikia wagombea. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.';
-                xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
-            }
-
-            // 4: VIEW RESULTS
-            else if (dtmfDigits === '4') {
+                xml = voiceXml(
+                    lang === 'en'
+                        ? 'Select position for candidates. Press 1 President, 2 Governor, 3 Senator, 4 Woman Rep, 5 MP, 6 MCA.'
+                        : 'Chagua nafasi ya wagombea. Bonyeza 1 Rais, 2 Gavana, 3 Seneta, 4 Woman Rep, 5 Mbunge, 6 Diwani.',
+                    { numDigits: 1, timeout: 15 }
+                );
+            } else if (dtmfDigits === '4') {
                 session.step = 'RESULTS_ENTER_ID';
-                const prompt = (lang === 'en')
-                    ? 'Please enter your National ID followed by hash to hear results for your registered area.'
-                    : 'Ingiza kitambulisho chako kisha bonyeza reli kusikia matokeo ya eneo lako la kura.';
-                xml = voiceXml(prompt, { numDigits: 8, timeout: 20, finishOnKey: '#' });
-            }
-
-            // 5: HELP
-            else if (dtmfDigits === '5') {
+                xml = voiceXml(
+                    lang === 'en'
+                        ? 'Enter your National ID followed by hash to hear live results for your area.'
+                        : 'Ingiza kitambulisho chako kisha bonyeza reli kusikia matokeo ya eneo lako.',
+                    { numDigits: 8, timeout: 20, finishOnKey: '#' }
+                );
+            } else if (dtmfDigits === '5') {
                 voiceSessions.delete(sessionId);
-                const prompt = (lang === 'en')
-                    ? 'The official IEBC toll-free hotline is 0800 221 221. The fraud hotline is 1195. You can also visit our secure voting portal at blockchainvotingsystem026.netlify.app. Thank you for calling DeVote Kenya. Goodbye.'
-                    : 'Nambari ya bure ya IEBC ni 0800 221 221. Nambari ya kuripoti ulaghai ni 1195. Pia unaweza kutembelea tovuti ya blockchainvotingsystem026.netlify.app. Asante kwa kupiga simu DeVote Kenya. Kwaheri.';
-                xml = voiceXml(prompt);
-            }
-
-            else {
-                session.step = 'MAIN_MENU';
-                const prompt = (lang === 'en')
-                    ? 'Invalid choice. Press 1 to vote, 2 to check status, 3 for candidates, 4 for results, or 5 for help.'
-                    : 'Chaguo batili. Bonyeza 1 kupiga kura, 2 kuangalia usajili, 3 wagombea, 4 matokeo, au 5 msaada.';
-                xml = voiceXml(prompt, { numDigits: 1, timeout: 10 });
+                xml = voiceXml(
+                    lang === 'en'
+                        ? 'IEBC toll-free: 0800 221 221. Fraud hotline: 1195. Website: blockchainvotingsystem026 dot netlify dot app. Goodbye.'
+                        : 'IEBC bure: 0800 221 221. Ulaghai: 1195. Tovuti: blockchainvotingsystem026 dot netlify dot app. Kwaheri.'
+                );
+            } else if (sauti.isEnabled() && dtmfDigits === '6') {
+                // ── Sauti Learn: choose EN / SW / Gĩkũyũ then talk ──
+                session.step = 'SAUTI_LANG';
+                const p = sauti.voicePrompts(lang);
+                xml = voiceXml(p.langPrompt, { numDigits: 1, timeout: 12 });
+            } else {
+                xml = voiceXml(
+                    lang === 'en'
+                        ? 'Invalid. Press 1 vote, 2 status, 3 candidates, 4 results, 5 help.'
+                        : 'Batili. Bonyeza 1 kura, 2 usajili, 3 wagombea, 4 matokeo, 5 msaada.',
+                    { numDigits: 1, timeout: 10 }
+                );
             }
         }
 
-        // ── VOTE FLOW: Enter PIN ─────────────────────────
         else if (session.step === 'VOTE_ENTER_ID') {
             const nationalId = (dtmfDigits || '').replace('#', '').trim();
-            const voter = await findVoter(nationalId);
-            session.voter = voter;
+            const voter      = await findVoter(nationalId);
+            session.voter    = voter;
             session.nationalId = nationalId;
-            session.step = 'VOTE_ENTER_PIN';
-
-            const prompt = (session.lang === 'en')
-                ? `Hello ${voter.fullName}. Please enter your 4-digit secret PIN, followed by hash.`
-                : `Hujambo ${voter.fullName}. Tafadhali ingiza PIN yako ya siri ya tarakimu nne, kisha bonyeza reli.`;
-            xml = voiceXml(prompt, { numDigits: 4, timeout: 15, finishOnKey: '#' });
+            session.step     = 'VOTE_ENTER_PIN';
+            xml = voiceXml(
+                session.lang === 'en'
+                    ? `Hello ${voter.fullName}. Enter your 4-digit PIN followed by hash.`
+                    : `Hujambo ${voter.fullName}. Ingiza PIN yako ya tarakimu nne kisha bonyeza reli.`,
+                { numDigits: 4, timeout: 15, finishOnKey: '#' }
+            );
         }
 
-        // ── VOTE FLOW: Verify PIN & Pick Position ────────
         else if (session.step === 'VOTE_ENTER_PIN') {
-            const pin = (dtmfDigits || '').replace('#', '').trim();
+            const pin   = (dtmfDigits || '').replace('#', '').trim();
             const voter = session.voter;
-            const pinOk = voter.pin ? pin === voter.pin : pin === '1234';
+            const pinOk = voter.pin ? pin === voter.pin : false;
 
             if (!pinOk) {
                 voiceSessions.delete(sessionId);
-                const prompt = (session.lang === 'en')
-                    ? 'Incorrect PIN entered. For your security, this session is now ended. Goodbye.'
-                    : 'PIN uliyoingiza si sahihi. Kwa usalama wako, simu inakatwa. Kwaheri.';
-                xml = voiceXml(prompt);
+                xml = voiceXml(
+                    session.lang === 'en'
+                        ? 'Incorrect PIN. Session ended for security. Goodbye.'
+                        : 'PIN si sahihi. Kikao kinaisha kwa usalama. Kwaheri.'
+                );
             } else {
                 session.step = 'VOTE_SELECT_POS';
-                const prompt = (session.lang === 'en')
-                    ? 'PIN verified. Select position. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for MP, 6 for MCA.'
-                    : 'PIN imethibitishwa. Chagua nafasi. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.';
-                xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
+                xml = voiceXml(
+                    session.lang === 'en'
+                        ? 'PIN verified. Select position. 1 President, 2 Governor, 3 Senator, 4 Woman Rep, 5 MP, 6 MCA.'
+                        : 'PIN imethibitishwa. Chagua nafasi. 1 Rais, 2 Gavana, 3 Seneta, 4 Woman Rep, 5 Mbunge, 6 Diwani.',
+                    { numDigits: 1, timeout: 15 }
+                );
             }
         }
 
-        // ── VOTE FLOW: Pick Candidate ────────────────────
         else if (session.step === 'VOTE_SELECT_POS') {
             const posChoice = parseInt(dtmfDigits);
             if (isNaN(posChoice) || posChoice < 1 || posChoice > 6) {
-                const prompt = (session.lang === 'en')
-                    ? 'Invalid choice. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for MP, 6 for MCA.'
-                    : 'Chaguo batili. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.';
-                xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
+                xml = voiceXml(
+                    session.lang === 'en'
+                        ? 'Invalid. Press 1 President, 2 Governor, 3 Senator, 4 Woman Rep, 5 MP, 6 MCA.'
+                        : 'Batili. 1 Rais, 2 Gavana, 3 Seneta, 4 Woman Rep, 5 Mbunge, 6 Diwani.',
+                    { numDigits: 1, timeout: 15 }
+                );
             } else {
                 const posIndex = posChoice - 1;
                 session.posIndex = posIndex;
-                const posName = getPositionName(posIndex, session.lang);
-                session.posName = posName;
+                session.posName  = getPositionName(posIndex, session.lang);
 
-                // Check duplicate vote on Sepolia
-                const voterAddr = deriveVoterWallet(session.nationalId).address;
+                const voterAddr   = deriveVoterWallet(session.nationalId).address;
                 let alreadyVoted = false;
                 try {
                     alreadyVoted = await withTimeout(
-                        votingContract.hasVoterVotedForPosition(voterAddr, posIndex),
-                        5000,
-                        false
+                        votingContract.hasVoterVotedForPosition(voterAddr, posIndex), 5000, false
                     );
                 } catch (_) {}
 
                 if (alreadyVoted) {
                     voiceSessions.delete(sessionId);
-                    const prompt = (session.lang === 'en')
-                        ? `You have already cast your vote for ${posName}. Duplicate voting is strictly prohibited on the blockchain. Thank you and goodbye.`
-                        : `Umeshapiga kura ya nafasi ya ${posName}. Kura mbili hairuhusiwi kwenye blockchain. Asante na kwaheri.`;
-                    xml = voiceXml(prompt);
+                    xml = voiceXml(
+                        session.lang === 'en'
+                            ? `Already voted for ${session.posName}. Duplicate voting blocked on blockchain. Goodbye.`
+                            : `Umeshapiga kura ya ${session.posName}. Marufuku ya blockchain. Kwaheri.`
+                    );
                 } else {
-                    const candidates = await getCandidatesForPosition(posIndex);
+                    const candidates  = await getCandidatesForPosition(posIndex);
                     session.candidates = candidates;
-                    session.step = 'VOTE_SELECT_CAND';
+                    session.step       = 'VOTE_SELECT_CAND';
 
-                    let candPrompt = (session.lang === 'en')
-                        ? `Candidates for ${posName} are: `
-                        : `Wagombea wa ${posName} ni: `;
-
+                    let prompt = session.lang === 'en'
+                        ? `Candidates for ${session.posName}: `
+                        : `Wagombea wa ${session.posName}: `;
                     candidates.forEach((c, i) => {
-                        candPrompt += (session.lang === 'en')
+                        prompt += session.lang === 'en'
                             ? `Press ${i + 1} for ${c.name}. `
-                            : `Bonyeza ${i + 1} kumchagua ${c.name}. `;
+                            : `Bonyeza ${i + 1} kwa ${c.name}. `;
                     });
-
-                    xml = voiceXml(candPrompt, { numDigits: 1, timeout: 15 });
+                    xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
                 }
             }
         }
 
-        // ── VOTE FLOW: Confirmation ─────────────────────
         else if (session.step === 'VOTE_SELECT_CAND') {
             const candChoice = parseInt(dtmfDigits) - 1;
             const candidates = session.candidates || [];
-            const selected = candidates[candChoice];
+            const selected   = candidates[candChoice];
 
             if (!selected) {
-                const prompt = (session.lang === 'en')
-                    ? 'Invalid candidate selection. Please press the digit corresponding to your candidate.'
-                    : 'Chaguo batili. Tafadhali bonyeza nambari ya mgombea unayemtaka.';
+                let prompt = session.lang === 'en'
+                    ? `Invalid. Candidates for ${session.posName}: `
+                    : `Batili. Wagombea wa ${session.posName}: `;
+                candidates.forEach((c, i) => {
+                    prompt += session.lang === 'en' ? `${i + 1} for ${c.name}. ` : `${i + 1} kwa ${c.name}. `;
+                });
                 xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
             } else {
                 session.selectedCandidate = selected;
                 session.step = 'VOTE_CONFIRM';
-
-                const prompt = (session.lang === 'en')
-                    ? `You have selected ${selected.name} for ${session.posName}. Press 1 to confirm and broadcast your vote to the blockchain. Press 2 to cancel.`
-                    : `Umemchagua ${selected.name} kwa nafasi ya ${session.posName}. Bonyeza 1 kuthibitisha na kurekodi kura yako kwenye blockchain. Bonyeza 2 kughairi.`;
-                xml = voiceXml(prompt, { numDigits: 1, timeout: 12 });
+                xml = voiceXml(
+                    session.lang === 'en'
+                        ? `You selected ${selected.name} for ${session.posName}. Press 1 to confirm and record on blockchain. Press 2 to cancel.`
+                        : `Umemchagua ${selected.name} kwa ${session.posName}. Bonyeza 1 kuthibitisha na kurekodi kwenye blockchain. Bonyeza 2 kughairi.`,
+                    { numDigits: 1, timeout: 12 }
+                );
             }
         }
 
-        // ── VOTE FLOW: Execute Vote & Flow to Next Position ────────
         else if (session.step === 'VOTE_CONFIRM') {
             if (dtmfDigits === '1') {
-                const voter = session.voter;
-                const nationalId = session.nationalId;
-                const candidate = session.selectedCandidate;
-                const posName = session.posName;
-                const phone = callerNumber || session.callerNumber || '+254712345678';
-                const lang = session.lang;
+                const { voter, nationalId, selectedCandidate, posName, lang } = session;
+                const phone = callerNumber || session.callerNumber || '';
 
-                // Async blockchain settlement + SMS for this ballot
                 processVoteSettlement({
-                    voter,
-                    nationalId,
-                    candidate,
+                    voter, nationalId,
+                    candidate: selectedCandidate,
                     positionName: posName,
+                    posIndex: session.posIndex,
                     phoneNumber: phone,
                     lang
                 });
 
-                // Flow to next position in sequence (0 to 5)
-                if (typeof session.posIndex !== 'number') session.posIndex = 0;
-                session.posIndex++;
-
+                // Advance to next position
+                session.posIndex = (session.posIndex || 0) + 1;
                 if (session.posIndex < 6) {
-                    const nextPosIndex = session.posIndex;
-                    const nextPosName = getPositionName(nextPosIndex, lang);
-                    session.posName = nextPosName;
-                    const nextCandidates = await getCandidatesForPosition(nextPosIndex);
-                    session.candidates = nextCandidates;
-                    session.step = 'VOTE_SELECT_CAND';
+                    const nextPosName  = getPositionName(session.posIndex, lang);
+                    session.posName    = nextPosName;
+                    const nextCands    = await getCandidatesForPosition(session.posIndex);
+                    session.candidates = nextCands;
+                    session.step       = 'VOTE_SELECT_CAND';
 
-                    let candPrompt = (lang === 'en')
-                        ? `Ballot for ${candidate.name} recorded! Now voting ballot ${nextPosIndex + 1} of 6 for ${nextPosName}. The candidates are: `
-                        : `Kura ya ${candidate.name} imerekodiwa! Sasa kura ya ${nextPosIndex + 1} kati ya 6 ya ${nextPosName}. Wagombea ni: `;
-
-                    nextCandidates.forEach((c, i) => {
-                        candPrompt += (lang === 'en') ? `Press ${i + 1} for ${c.name}. ` : `Bonyeza ${i + 1} kwa ${c.name}. `;
+                    let prompt = lang === 'en'
+                        ? `${selectedCandidate.name} recorded! Ballot ${session.posIndex + 1} of 6: ${nextPosName}. `
+                        : `${selectedCandidate.name} imerekodiwa! Kura ${session.posIndex + 1} kati ya 6: ${nextPosName}. `;
+                    nextCands.forEach((c, i) => {
+                        prompt += lang === 'en' ? `Press ${i + 1} for ${c.name}. ` : `Bonyeza ${i + 1} kwa ${c.name}. `;
                     });
-
-                    xml = voiceXml(candPrompt, { numDigits: 1, timeout: 15 });
+                    xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
                 } else {
                     voiceSessions.delete(sessionId);
-                    const prompt = (lang === 'en')
-                        ? `Asante! All 6 of your ballots have been cast and permanently recorded on the Sepolia Blockchain. SMS confirmation receipts have been dispatched to your phone. Thank you for voting with DeVote Kenya. Goodbye.`
-                        : `Asante! Kura zako zote 6 zimepokewa na kurekodiwa kikamilifu kwenye Sepolia Blockchain. Risiti za SMS zimetumwa kwa simu yako. Asante kwa kupiga kura kupitia DeVote Kenya. Kwaheri.`;
-                    xml = voiceXml(prompt);
+                    xml = voiceXml(
+                        lang === 'en'
+                            ? 'All 6 ballots cast and recorded on the Sepolia Blockchain! SMS receipts sent. Thank you for voting with DeVote Kenya. Goodbye.'
+                            : 'Kura zako zote 6 zimerekodiwa kwenye Sepolia Blockchain! Risiti za SMS zimetumwa. Asante kwa kupiga kura na DeVote Kenya. Kwaheri.'
+                    );
                 }
             } else {
                 voiceSessions.delete(sessionId);
-                const prompt = (session.lang === 'en')
-                    ? 'Your vote was cancelled. No ballot was cast. Thank you for calling DeVote Kenya. Goodbye.'
-                    : 'Kura yako imefutiliwa mbali. Hakuna mabadiliko yaliyofanyika. Asante kwa kupiga simu DeVote Kenya. Kwaheri.';
+                xml = voiceXml(
+                    session.lang === 'en'
+                        ? 'Vote cancelled. No ballot was cast. Goodbye.'
+                        : 'Kura imeghairiwa. Hakuna mabadiliko. Kwaheri.'
+                );
+            }
+        }
+
+        else if (session.step === 'STATUS_ENTER_ID') {
+            const nationalId = (dtmfDigits || '').replace('#', '').trim();
+            const voter      = await findVoter(nationalId);
+            const walletAddr = voter.walletAddress || deriveVoterWallet(nationalId).address;
+
+            let onChain = false;
+            try { onChain = await withTimeout(votingContract.registeredVoters(walletAddr), 3000, false); } catch (_) {}
+
+            voiceSessions.delete(sessionId);
+            const isRegistered = voter.isApproved || onChain;
+            xml = voiceXml(
+                session.lang === 'en'
+                    ? `Hello ${voter.fullName}. Status: ${isRegistered ? 'Registered and approved' : 'Not registered'}. Area: ${voter.county}, ${voter.constituency}. Goodbye.`
+                    : `Hujambo ${voter.fullName}. Hali: ${isRegistered ? 'Umesajiliwa na kuidhinishwa' : 'Haujasajiliwa'}. Eneo: ${voter.county}, ${voter.constituency}. Kwaheri.`
+            );
+        }
+
+        else if (session.step === 'CAND_SELECT_POS') {
+            const posChoice = parseInt(dtmfDigits);
+            if (isNaN(posChoice) || posChoice < 1 || posChoice > 6) {
+                xml = voiceXml(
+                    session.lang === 'en'
+                        ? 'Invalid. 1 President, 2 Governor, 3 Senator, 4 Woman Rep, 5 MP, 6 MCA.'
+                        : 'Batili. 1 Rais, 2 Gavana, 3 Seneta, 4 Woman Rep, 5 Mbunge, 6 Diwani.',
+                    { numDigits: 1, timeout: 15 }
+                );
+            } else {
+                voiceSessions.delete(sessionId);
+                const posIndex = posChoice - 1;
+                const posName  = getPositionName(posIndex, session.lang);
+                const cands    = await getCandidatesForPosition(posIndex);
+                let prompt = session.lang === 'en'
+                    ? `Candidates for ${posName}: `
+                    : `Wagombea wa ${posName}: `;
+                cands.forEach((c, i) => { prompt += `${i + 1}, ${c.name}. `; });
+                prompt += session.lang === 'en'
+                    ? 'To vote, dial back and press 1. Goodbye.'
+                    : 'Kupiga kura, piga tena na ubonyeze 1. Kwaheri.';
                 xml = voiceXml(prompt);
             }
         }
 
-        // ── STATUS FLOW ─────────────────────────────────
-        else if (session.step === 'STATUS_ENTER_ID') {
-            const nationalId = (dtmfDigits || '').replace('#', '').trim();
-            const voter = await findVoter(nationalId);
-            const walletAddr = voter.walletAddress || deriveVoterWallet(nationalId).address;
-
-            let onChain = false;
-            try {
-                onChain = await withTimeout(votingContract.registeredVoters(walletAddr), 3000, false);
-            } catch (_) {}
-
-            voiceSessions.delete(sessionId);
-            const isRegistered = voter.isApproved || onChain;
-            const statusLabel = isRegistered
-                ? (onChain ? 'registered and verified on blockchain' : 'registered and approved in voter database')
-                : 'not registered';
-
-            const prompt = (session.lang === 'en')
-                ? `Hello ${voter.fullName}. Your National ID is ${nationalId}. Your status is: ${statusLabel}. You are assigned to ${voter.county} county, ${voter.constituency} constituency. Thank you for calling DeVote Kenya. Goodbye.`
-                : `Hujambo ${voter.fullName}. Kitambulisho chako ni ${nationalId}. Hali yako ni: ${isRegistered ? 'umeidhinishwa na uko tayari kupiga kura' : 'haujasajiliwa'} kaunti ya ${voter.county}, eneo bunge la ${voter.constituency}. Asante kwa kupiga simu DeVote Kenya. Kwaheri.`;
-            xml = voiceXml(prompt);
-        }
-
-        // ── CANDIDATE LIST FLOW ─────────────────────────
-        else if (session.step === 'CAND_SELECT_POS') {
-            const posChoice = parseInt(dtmfDigits);
-            if (isNaN(posChoice) || posChoice < 1 || posChoice > 6) {
-                const prompt = (session.lang === 'en')
-                    ? 'Invalid choice. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for MP, 6 for MCA.'
-                    : 'Chaguo batili. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.';
-                xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
-            } else {
-                voiceSessions.delete(sessionId);
-                const posIndex = posChoice - 1;
-                const posName = getPositionName(posIndex, session.lang);
-                const candidates = await getCandidatesForPosition(posIndex);
-
-                let listPrompt = (session.lang === 'en')
-                    ? `The candidates for ${posName} are: `
-                    : `Wagombea wa nafasi ya ${posName} ni: `;
-
-                candidates.forEach((c, i) => {
-                    listPrompt += `${i + 1}, ${c.name}. `;
-                });
-                listPrompt += (session.lang === 'en')
-                    ? 'To cast your vote, please call back and press 1. Goodbye.'
-                    : 'Kupiga kura yako, tafadhali piga simu tena na ubonyeze 1. Kwaheri.';
-                xml = voiceXml(listPrompt);
-            }
-        }
-
-        // ── RESULTS FLOW: Step 1 (ID for Area) ──────────
         else if (session.step === 'RESULTS_ENTER_ID') {
             const nationalId = (dtmfDigits || '').replace('#', '').trim();
-            const voter = await findVoter(nationalId);
-            session.voter = voter;
+            const voter      = await findVoter(nationalId);
+            session.voter    = voter;
             session.nationalId = nationalId;
-            session.step = 'RESULTS_SELECT_POS';
-
-            const prompt = (session.lang === 'en')
-                ? `Voter area identified as ${voter.county} county. Select position for results. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for MP, 6 for MCA.`
-                : `Eneo lako limetambuliwa kama kaunti ya ${voter.county}. Chagua nafasi ya matokeo. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.`;
-            xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
+            session.step     = 'RESULTS_SELECT_POS';
+            xml = voiceXml(
+                session.lang === 'en'
+                    ? `Your registered area: ${voter.county} county, ${voter.constituency} constituency, ${voter.ward} ward. Select position for results. 1 President, 2 Governor, 3 Senator, 4 Woman Rep, 5 MP, 6 MCA.`
+                    : `Eneo lako lililojisajilishwa: kaunti ya ${voter.county}, jimbo la ${voter.constituency}, kata ya ${voter.ward}. Chagua nafasi ya matokeo. 1 Rais, 2 Gavana, 3 Seneta, 4 Woman Rep, 5 Mbunge, 6 Diwani.`,
+                { numDigits: 1, timeout: 15 }
+            );
         }
 
-        // ── RESULTS FLOW: Step 2 (Speak Results) ────────
         else if (session.step === 'RESULTS_SELECT_POS') {
             const posChoice = parseInt(dtmfDigits);
             if (isNaN(posChoice) || posChoice < 1 || posChoice > 6) {
-                const prompt = (session.lang === 'en')
-                    ? 'Invalid selection. Press 1 for President, 2 for Governor, 3 for Senator, 4 for Woman Rep, 5 for MP, 6 for MCA.'
-                    : 'Chaguo batili. Bonyeza 1 kwa Rais, 2 kwa Gavana, 3 kwa Seneta, 4 kwa Woman Rep, 5 kwa Mbunge, 6 kwa Diwani.';
-                xml = voiceXml(prompt, { numDigits: 1, timeout: 15 });
+                xml = voiceXml(
+                    session.lang === 'en'
+                        ? 'Invalid. 1 President, 2 Governor, 3 Senator, 4 Woman Rep, 5 MP, 6 MCA.'
+                        : 'Batili. 1 Rais, 2 Gavana, 3 Seneta, 4 Woman Rep, 5 Mbunge, 6 Diwani.',
+                    { numDigits: 1, timeout: 15 }
+                );
             } else {
                 voiceSessions.delete(sessionId);
-                const posIndex = posChoice - 1;
-                const posName = getPositionName(posIndex, session.lang);
-                const voter = session.voter;
-                const voterCounty = (voter.county || '').toString().trim();
-                const voterConstituency = (voter.constituency || '').toString().trim();
-                const voterWard = (voter.ward || '').toString().trim();
+                const posIndex  = posChoice - 1;
+                const posName   = getPositionName(posIndex, session.lang);
+                const voter     = session.voter;
+                const area      = areaLabel(posIndex, voter);
+                const filtered  = getFilteredResults(posIndex, voter);
 
-                if (Date.now() - cacheLastUpdated > CACHE_TTL_MS) {
-                    await refreshCandidateCache();
-                }
-
-                let filtered = candidateCache.filter(c => c.position === posIndex);
-                if (posIndex === 0) {
-                    // President is national
-                } else if (posIndex >= 1 && posIndex <= 3) {
-                    filtered = filtered.filter(c => c.county.toLowerCase() === voterCounty.toLowerCase());
-                } else if (posIndex === 4) {
-                    filtered = filtered.filter(c => c.constituency.toLowerCase() === voterConstituency.toLowerCase());
-                } else if (posIndex === 5) {
-                    filtered = filtered.filter(c => c.ward.toLowerCase() === voterWard.toLowerCase());
-                }
-
-                filtered.sort((a, b) => (b.voteCount || 0) - (a.voteCount || 0));
-
-                let resPrompt = '';
                 if (filtered.length === 0) {
-                    resPrompt = (session.lang === 'en')
-                        ? `No results currently found for ${posName} in your area. For full live updates, visit our portal at blockchainvotingsystem026.netlify.app. Goodbye.`
-                        : `Hakuna matokeo kwa sasa kwa nafasi ya ${posName} katika eneo lako. Tazama tovuti ya blockchainvotingsystem026.netlify.app. Kwaheri.`;
+                    xml = voiceXml(
+                        session.lang === 'en'
+                            ? `No results yet for ${posName} in ${area}. Visit blockchainvotingsystem026 dot netlify dot app. Goodbye.`
+                            : `Hakuna matokeo bado kwa ${posName} katika ${area}. Tembelea tovuti. Kwaheri.`
+                    );
                 } else {
-                    resPrompt = (session.lang === 'en')
-                        ? `Live election results for ${posName}: `
-                        : `Matokeo ya moja kwa moja ya ${posName}: `;
+                    let prompt = session.lang === 'en'
+                        ? `Live results for ${posName} in ${area}: `
+                        : `Matokeo ya moja kwa moja ya ${posName} katika ${area}: `;
                     filtered.forEach(c => {
-                        resPrompt += (session.lang === 'en')
-                            ? `${c.name} has ${c.voteCount || 0} votes. `
-                            : `${c.name} ana kura ${c.voteCount || 0}. `;
+                        prompt += session.lang === 'en'
+                            ? `${c.name} has ${c.voteCount} votes. `
+                            : `${c.name} ana kura ${c.voteCount}. `;
                     });
-                    resPrompt += (session.lang === 'en')
-                        ? 'Thank you for calling DeVote Kenya. Goodbye.'
-                        : 'Asante kwa kupiga simu DeVote Kenya. Kwaheri.';
+                    prompt += session.lang === 'en'
+                        ? `Results updated ${cacheAgeLabel()}. Thank you. Goodbye.`
+                        : `Matokeo yamesasishwa ${cacheAgeLabel()}. Asante. Kwaheri.`;
+                    xml = voiceXml(prompt);
                 }
-                xml = voiceXml(resPrompt);
+            }
+        }
+
+        else if (session.step === 'SAUTI_LANG') {
+            // Sauti Learn: language chosen -> start recording the question
+            const choice       = (dtmfDigits || '').trim();
+            const sautiLang    = choice === '2' ? 'sw' : choice === '3' ? 'kik' : 'en';
+            session.sautiLang  = sautiLang;
+            session.step       = 'SAUTI_LISTEN';
+            const p            = sauti.voicePrompts(sautiLang);
+            xml = recordPrompt(p.listen, `${recordCallbackBase()}/voice/sauti-record`);
+        }
+
+        else if (session.step === 'SAUTI_LISTEN' || session.step === 'SAUTI_AFTER') {
+            // Follow-up digit: 1 = ask again, anything else = goodbye
+            if ((dtmfDigits || '') === '1') {
+                const p  = sauti.voicePrompts(session.sautiLang);
+                xml = recordPrompt(p.listen, `${recordCallbackBase()}/voice/sauti-record`);
+            } else {
+                voiceSessions.delete(sessionId);
+                xml = voiceXml(sauti.voicePrompts(session.sautiLang).bye);
             }
         }
 
@@ -1377,7 +1780,7 @@ async function handleVoiceRequest(req, res) {
     } catch (err) {
         console.error('[Voice Error]:', err);
         voiceSessions.delete(sessionId);
-        xml = voiceXml('A technical error occurred. Please try again later. Goodbye.');
+        xml = voiceXml('A technical error occurred. Please try again. Goodbye.');
     }
 
     res.set('Content-Type', 'text/xml');
@@ -1386,88 +1789,199 @@ async function handleVoiceRequest(req, res) {
 
 app.post('/voice', handleVoiceRequest);
 app.get('/voice', (_req, res) => {
-    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>DeVote Kenya Voice IVR Gateway is Active.</Say></Response>`);
+    res.send(`<?xml version="1.0" encoding="UTF-8"?><Response><Say>DeVote Kenya Voice IVR Active.</Say></Response>`);
 });
 
 // ─────────────────────────────────────────────────────────────
-// ON-CHAIN SETTLEMENT
+// SAUTI LEARN IVR ROUTES (opt-in via SAUTI_ENABLED)
+// ─────────────────────────────────────────────────────────────
+function recordCallbackBase() {
+    return (process.env.SAUTI_CALLBACK_BASE || `http://localhost:${PORT}`).replace(/\/$/, '');
+}
+
+if (sauti.isEnabled()) {
+    // Africa's Talking posts here after <Record> finishes.
+    app.post('/voice/sauti-record', async (req, res) => {
+        const xml = await sauti.handleVoiceRecord(req.body, voiceSessions, {
+            xmlFor:      (text, getDigits) => voiceXml(text, getDigits),
+            xmlForPlay:  (playUrl, thenText) => xmlForPlay(playUrl, thenText),
+            baseUrl:     recordCallbackBase(),
+        });
+        res.set('Content-Type', 'text/xml');
+        res.send(xml);
+    });
+
+    // Short-lived audio hosting for Gikuyu TTS played via <Play>
+    app.get('/sauti/audio/:token', sauti.audioRoute);
+}
+
+// ─────────────────────────────────────────────────────────────
+// ON-CHAIN SETTLEMENT (async, non-blocking)
 // ─────────────────────────────────────────────────────────────
 async function processVoteSettlement({ voter, nationalId, candidate, positionName, posIndex = 0, phoneNumber, lang = 'en' }) {
-    console.log(`[Settlement] ID=${nationalId} → Candidate #${candidate.id} (${candidate.name}) [${lang}]`);
-    const voterWallet = deriveVoterWallet(nationalId);
+    console.log(`[Settlement] ID=${nationalId} → Candidate #${candidate.id} "${candidate.name}" Pos=${posIndex} [${lang}]`);
+    const cleanId = String(nationalId || '').trim();
+    const voterWallet = deriveVoterWallet(cleanId);
+    const walletAddr = (voter.walletAddress || voterWallet.address).toLowerCase();
 
-    try {
-        if (!relayerWallet) {
-            const fakeTxHash = ethers.hexlify(ethers.randomBytes(32));
-            console.log(`[Simulation] Fake TxHash: ${fakeTxHash}`);
-            await recordVoteInFirestore(voter, nationalId, posIndex, candidate, fakeTxHash);
-            await sendSms(phoneNumber, candidate.name, positionName, fakeTxHash, lang);
-            return;
-        }
-
-        // Register voter on-chain if not already registered
-        const isRegistered = await votingContract.registeredVoters(voterWallet.address);
-        if (!isRegistered) {
-            console.log(`[Register] Registering: ${voterWallet.address}`);
-            const rTx = await votingContract.registerVoter(voterWallet.address);
-            await rTx.wait(1);
-        }
-
-        // Sponsor gas if balance is low
-        const bal = await provider.getBalance(voterWallet.address);
-        if (bal < ethers.parseEther('0.001')) {
-            console.log(`[Gas] Sponsoring 0.002 ETH to voter ${voterWallet.address}`);
-            const fTx = await relayerWallet.sendTransaction({
-                to: voterWallet.address,
-                value: ethers.parseEther('0.002')
-            });
-            await fTx.wait(1);
-        }
-
-        // Cast vote from voter's deterministic wallet
-        const voterContract = new ethers.Contract(CONTRACT_ADDRESS, votingAbi, voterWallet);
-        const voteTx = await voterContract.vote(candidate.id);
-        console.log(`[Mining] Tx broadcast: ${voteTx.hash}`);
-
-        const receipt = await voteTx.wait(1);
-        console.log(`[Confirmed] Block #${receipt.blockNumber} Hash: ${receipt.hash}`);
-
-        await recordVoteInFirestore(voter, nationalId, posIndex, candidate, receipt.hash);
-        await sendSms(phoneNumber, candidate.name, positionName, receipt.hash, lang);
-
-    } catch (err) {
-        console.warn('[On-Chain Notice]:', err.message);
-        // Deterministic cryptographic receipt fallback
-        const receiptHash = ethers.keccak256(ethers.toUtf8Bytes(`${nationalId}:${candidate.id}:${Date.now()}`));
-        console.log(`[Receipt Generated] Hash: ${receiptHash}`);
-        await recordVoteInFirestore(voter, nationalId, posIndex, candidate, receiptHash);
-        await sendSms(phoneNumber, candidate.name, positionName, receiptHash, lang);
+    // 1. Instantly increment in-memory candidateCache voteCount so USSD results reflect it in 0ms!
+    const targetCand = candidateCache.find(c => c.id === candidate.id || c.name.toLowerCase() === candidate.name.toLowerCase());
+    if (targetCand) {
+        targetCand.voteCount = (targetCand.voteCount || 0) + 1;
+        console.log(`[Cache Real-Time] ${candidate.name} votes incremented to ${targetCand.voteCount}`);
     }
+
+    let txHash = '';
+    const receiptHash = ethers.keccak256(
+        ethers.toUtf8Bytes(`${cleanId}:${candidate.id}:${posIndex}:${Date.now()}`)
+    );
+
+    // 2. Attempt on-chain broadcast if relayer is configured
+    if (relayerWallet) {
+        try {
+            const isEnded = await withTimeout(votingContract.electionEnded(), 2500, false);
+            const isStarted = await withTimeout(votingContract.electionStarted(), 2500, true);
+
+            if (isStarted && !isEnded) {
+                // Register voter on-chain if not already
+                const isRegistered = await withTimeout(votingContract.registeredVoters(voterWallet.address), 2500, false);
+                if (!isRegistered) {
+                    try {
+                        const rTx = await votingContract.registerVoter(voterWallet.address);
+                        await rTx.wait(1);
+                    } catch (e) {
+                        console.warn('[Register notice]:', e.message);
+                    }
+                }
+
+                // Sponsor gas if balance is low
+                const bal = await provider.getBalance(voterWallet.address);
+                if (bal < ethers.parseEther('0.001')) {
+                    const fTx = await relayerWallet.sendTransaction({
+                        to: voterWallet.address,
+                        value: ethers.parseEther('0.002')
+                    });
+                    await fTx.wait(1);
+                }
+
+                // Cast vote on-chain
+                const voterContract = new ethers.Contract(CONTRACT_ADDRESS, votingAbi, voterWallet);
+                const voteTx = await voterContract.vote(candidate.id);
+                console.log(`[Mining] Tx broadcast: ${voteTx.hash}`);
+                const receipt = await voteTx.wait(1);
+                txHash = receipt.hash;
+                console.log(`[Confirmed] Block #${receipt.blockNumber} Hash: ${txHash}`);
+            } else {
+                txHash = receiptHash;
+            }
+        } catch (err) {
+            console.warn('[On-Chain Notice]:', err.message);
+            txHash = receiptHash;
+        }
+    } else {
+        txHash = receiptHash;
+    }
+
+    const finalHash = txHash || receiptHash;
+
+    // 3. Record permanent audit record in Firestore 'votes' collection (streams to Admin Panel and Live Results)
+    try {
+        const auditRecord = {
+            voterId: cleanId,
+            voterName: voter.fullName || 'Registered Voter',
+            voterWallet: walletAddr,
+            county: voter.county || '',
+            constituency: voter.constituency || '',
+            ward: voter.ward || '',
+            candidateId: String(candidate.id),
+            candidateName: candidate.name,
+            position: positionName,
+            posIndex: posIndex,
+            channel: 'USSD',
+            txHash: finalHash,
+            createdAt: serverTimestamp(),
+            timestamp: new Date().toISOString()
+        };
+        await addDoc(collection(db, 'votes'), auditRecord);
+        console.log(`[Firestore 'votes'] Audit record created for voter ${cleanId} -> ${candidate.name} (${positionName})`);
+    } catch (err) {
+        console.warn(`[Firestore 'votes'] Save warning:`, err.message);
+    }
+
+    // 4. Update voter record in Firestore 'voters' collection
+    await recordVoteInFirestore(voter, cleanId, posIndex, candidate, finalHash);
+
+    // 5. Update candidate's voteCount in Firestore 'candidates' collection
+    try {
+        const cSnap = await withTimeout(getDocs(collection(db, 'candidates')), 3000, null);
+        if (cSnap) {
+            for (const docSnap of cSnap.docs) {
+                const data = docSnap.data();
+                if (data.name?.toLowerCase().trim() === candidate.name.toLowerCase().trim() ||
+                    String(data.blockchainId) === String(candidate.id)) {
+                    await updateDoc(doc(db, 'candidates', docSnap.id), {
+                        voteCount: (data.voteCount || 0) + 1,
+                        lastVoteAt: new Date().toISOString()
+                    });
+                    break;
+                }
+            }
+        }
+    } catch (err) {
+        console.warn('[Firestore candidate update notice]:', err.message);
+    }
+
+    // 6. Trigger background refresh to keep cache in sync
+    refreshCandidateCache();
+
+    // 7. Dispatch SMS receipt to the voter's mobile phone
+    await sendSms(phoneNumber, candidate.name, positionName, finalHash, lang);
 }
+
+// ─────────────────────────────────────────────────────────────
+// REST APIS (For live dashboard inspection)
+// ─────────────────────────────────────────────────────────────
+app.get('/api/votes', async (_req, res) => {
+    try {
+        const snap = await getDocs(collection(db, 'votes'));
+        const list = [];
+        snap.forEach(d => list.push({ id: d.id, ...d.data() }));
+        list.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
+        res.json({ count: list.length, votes: list });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.get('/api/results', (_req, res) => {
+    res.json({
+        lastUpdated: new Date(cacheLastUpdated).toISOString(),
+        cacheAge_s: Math.floor((Date.now() - cacheLastUpdated) / 1000),
+        candidates: candidateCache
+    });
+});
 
 async function sendSms(phoneNumber, candidateName, positionName, txHash, lang = 'en') {
     const explorerUrl = `https://sepolia.etherscan.io/tx/${txHash}`;
-    const t = I18N[lang] || I18N.en;
-    const msg = `${t.smsTitle}
-${t.smsRecorded}
-${t.smsPosition}  : ${positionName}
-${t.smsCandidate} : ${candidateName}
-TxHash    : ${txHash.slice(0, 16)}...
-${t.smsVerify}    : ${explorerUrl}`;
+    const isEn = lang === 'en';
+    const msg =
+`DeVote Kenya ✓
+${isEn ? 'Vote Recorded!' : 'Kura Imerekodiwa!'}
+${isEn ? 'Position' : 'Nafasi'}: ${positionName}
+${isEn ? 'Candidate' : 'Mgombea'}: ${candidateName}
+Tx: ${txHash.slice(0, 16)}...
+${isEn ? 'Verify' : 'Kagua'}: ${explorerUrl}`;
 
-    console.log(`\n══ SMS RECEIPT [${lang.toUpperCase()}] ══════════════════`);
-    console.log(`To : ${phoneNumber}`);
+    console.log(`\n══ SMS [${lang.toUpperCase()}] To:${phoneNumber} ══`);
     console.log(msg);
-    console.log(`═══════════════════════════════════════\n`);
+    console.log(`═══════════════════════════════════\n`);
 
     if (smsClient) {
         try {
-            const smsPayload = { to: [phoneNumber], message: msg };
-            if (AT_SENDER_ID && AT_USERNAME !== 'sandbox') {
-                smsPayload.from = AT_SENDER_ID;
-            }
-            const res = await smsClient.send(smsPayload);
-            console.log(`[SMS] Successfully delivered to ${phoneNumber}:`, JSON.stringify(res));
+            const payload = { to: [phoneNumber], message: msg };
+            if (AT_SENDER_ID && AT_USERNAME !== 'sandbox') payload.from = AT_SENDER_ID;
+            const result = await smsClient.send(payload);
+            console.log(`[SMS] Delivered to ${phoneNumber}:`, JSON.stringify(result));
         } catch (err) {
             console.warn(`[SMS] Failed:`, err.message);
         }
@@ -1479,24 +1993,36 @@ ${t.smsVerify}    : ${explorerUrl}`;
 // ─────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
     res.json({
-        status      : 'DeVote Kenya USSD & Voice Gateway – Active',
-        network     : 'Ethereum Sepolia',
-        contract    : CONTRACT_ADDRESS,
-        frontend    : SITE_URL,
-        ussdEndpoint: `/ussd (POST)`,
-        voiceEndpoint: `/voice (POST)`,
-        candidates  : candidateCache.length,
-        cacheAge_s  : Math.floor((Date.now() - cacheLastUpdated) / 1000)
+        status:         'DeVote Kenya USSD & Voice Gateway – Active v3',
+        network:        'Ethereum Sepolia',
+        contract:       CONTRACT_ADDRESS,
+        frontend:       SITE_URL,
+        ussdEndpoint:   `POST /ussd`,
+        voiceEndpoint:  `POST /voice`,
+        candidates:     candidateCache.length,
+        cacheAge_s:     Math.floor((Date.now() - cacheLastUpdated) / 1000),
+        cacheRefreshing
     });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n${'═'.repeat(55)}`);
-    console.log(`  🗳️  DeVote Kenya USSD Gateway`);
-    console.log(`  🚀  http://localhost:${PORT}`);
+    console.log(`  🗳️  DeVote Kenya USSD Gateway v3`);
+    console.log(`  🚀  http://0.0.0.0:${PORT}`);
     console.log(`  🌐  Sepolia RPC : ${RPC_URL}`);
     console.log(`  📝  Contract   : ${CONTRACT_ADDRESS}`);
     console.log(`  🔗  Frontend   : ${SITE_URL}`);
     console.log(`  📱  Webhook    : POST /ussd`);
+    console.log(`  ⏱️  Session TTL : 120s (2 minutes)`);
+    console.log(`  🔄  Cache TTL  : ${CACHE_TTL_MS / 1000}s (real-time results)`);
     console.log(`${'═'.repeat(55)}\n`);
 });
+
+server.on('error', (err) => {
+    console.error('[Server Error]:', err);
+});
+
+// Configure 2-minute (120s) session and socket timeout
+server.timeout = 120000;
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 125000;

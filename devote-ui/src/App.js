@@ -8,6 +8,7 @@ import HowItWorksPage from "./pages/HowItWorksPage";
 import RegistrationPage from "./pages/RegistrationPage";
 import VotePage from "./pages/VotePage";
 import ResultsPage from "./pages/ResultsPage";
+import SautiLearnPage from "./sauti/SautiLearnPage";
 import useContract from "./hooks/useContract";
 import useElection from "./hooks/useElection";
 import useAdmin from "./hooks/useAdmin";
@@ -100,6 +101,10 @@ function App() {
         setCurrentPage('how-it-works');
       } else if (hash === 'registration') {
         setCurrentPage('registration');
+      } else if (hash === 'sauti') {
+        setCurrentPage('sauti');
+      } else if (hash === 'admin') {
+        setCurrentPage('admin');
       } else if (hash === 'vote') {
         setCurrentPage('vote');
       } else if (hash === 'results') {
@@ -162,6 +167,10 @@ function App() {
       window.location.hash = 'how-it-works';
     } else if (page === 'registration') {
       window.location.hash = 'registration';
+    } else if (page === 'sauti') {
+      window.location.hash = 'sauti';
+    } else if (page === 'admin') {
+      window.location.hash = 'admin';
     } else if (page === 'vote') {
       window.location.hash = 'vote';
     } else if (page === 'results') {
@@ -238,11 +247,49 @@ function App() {
 
   // Show Admin panel directly for admin users
   if (isAdmin) {
+    const sautiOn = process.env.REACT_APP_SAUTI_ENABLED !== 'false';
+
+    // Admins can also use the Sauti Learn voice teacher (and go back).
+    if (sautiOn && currentPage === 'sauti') {
+      // Keep admins inside their tools: voting/registration pages still
+      // belong to the admin panel UX for admin wallets.
+      const adminNavigate = (page) => {
+        if (page === 'registration' || page === 'vote' || page === 'results') {
+          return handleNavigate('admin');
+        }
+        return handleNavigate(page);
+      };
+      return (
+        <div className="min-h-screen">
+          <div className="bg-dark-green-600 text-white px-4 sm:px-6 py-3 flex flex-wrap items-center justify-between gap-2">
+            <span className="font-semibold">🔊 Sauti Learn — voice teacher</span>
+            <button
+              onClick={() => handleNavigate('admin')}
+              className="px-4 py-2 bg-white/20 hover:bg-white/30 rounded-lg text-sm font-medium transition-colors"
+            >
+              ← Back to Admin Panel
+            </button>
+          </div>
+          <SautiLearnPage onNavigate={adminNavigate} />
+        </div>
+      );
+    }
+
     return (
       <div className="min-h-screen bg-green-50 p-6">
-        <div className="bg-white p-4 mb-6 rounded-xl">
-          <p><strong>Connected:</strong> {account}</p>
-          <p><strong>Admin:</strong> {isAdmin ? "Yes" : "No"}</p>
+        <div className="bg-white p-4 mb-6 rounded-xl flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p><strong>Connected:</strong> {account}</p>
+            <p><strong>Admin:</strong> {isAdmin ? "Yes" : "No"}</p>
+          </div>
+          {sautiOn && (
+            <button
+              onClick={() => handleNavigate('sauti')}
+              className="px-4 py-2 bg-dark-green-600 hover:bg-dark-green-700 text-white rounded-lg text-sm font-medium transition-colors"
+            >
+              🔊 Open Sauti Learn
+            </button>
+          )}
         </div>
 
         <AdminPanel
@@ -292,6 +339,8 @@ function App() {
           return <HowItWorksPage {...pageProps} />;
         case 'registration':
           return <RegistrationPage {...pageProps} />;
+        case 'sauti':
+          return <SautiLearnPage {...pageProps} />;
         case 'vote':
           return <VotePage {...votePageProps} />;
         case 'results':
@@ -373,6 +422,8 @@ function App() {
         return <HowItWorksPage {...pageProps} />;
       case 'registration':
         return <RegistrationPage {...pageProps} />;
+      case 'sauti':
+        return <SautiLearnPage {...pageProps} />;
       case 'vote':
         return <VotePage {...votePageProps} />;
       case 'results':

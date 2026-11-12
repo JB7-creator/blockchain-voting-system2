@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { ethers } from "ethers";
+import { collection, onSnapshot, addDoc, serverTimestamp } from "firebase/firestore";
+import { db } from "../firebase";
 import { getAllCandidateProfiles, saveCandidateProfile } from "../services/candidateService";
 import { POSITION_INDEX, normalizePosition, getPositionIndex } from "../utils/electionFilters";
 
@@ -182,6 +184,51 @@ const useElection = (contract) => {
       setIsLoading(false);
     }
   }, [contract]);
+
+  // Real-time listener for votes (streams live votes from USSD and Web directly into candidates tally)
+  useEffect(() => {
+    let unsubscribe;
+    try {
+      unsubscribe = onSnapshot(
+        collection(db, "votes"),
+        (snapshot) => {
+          const voteCountsByName = {};
+          const voteCountsById = {};
+
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data();
+            const name = (data.candidateName || "").toLowerCase().trim();
+            const id = String(data.candidateId || "");
+            if (name) voteCountsByName[name] = (voteCountsByName[name] || 0) + 1;
+            if (id) voteCountsById[id] = (voteCountsById[id] || 0) + 1;
+          });
+
+          setCandidates((prev) => {
+            if (!prev || prev.length === 0) return prev;
+            return prev.map((cand) => {
+              const name = (cand.name || "").toLowerCase().trim();
+              const id = String(cand.id || cand.blockchainId || "");
+              const fsVotes = Math.max(voteCountsByName[name] || 0, voteCountsById[id] || 0);
+              const currentVotes = Number(cand.voteCount || 0);
+              return {
+                ...cand,
+                voteCount: Math.max(currentVotes, fsVotes),
+              };
+            });
+          });
+        },
+        (err) => {
+          console.warn("[useElection] Live votes snapshot warning:", err);
+        }
+      );
+    } catch (e) {
+      console.warn("[useElection] Live votes listener init error:", e);
+    }
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
 
   const checkVoterInfo = useCallback(
     async (account) => {

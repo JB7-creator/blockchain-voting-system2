@@ -23,3 +23,19 @@ services:
         sync: false
       - key: RELAYER_PRIVATE_KEY
         sync: false
+      - key: SAUTI_ENABLED
+        value: "false"
+      - key: SAUTI_URL
+        value: https://sauti-learn-service.onrender.com
+      - key: SAUTI_CALLBACK_BASE
+        value: https://devote-ussd-gateway.onrender.com
+  - type: web
+    name: sauti-learn-service
+    env: node
+    plan: free
+    rootDir: sauti-learn-service
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: PORT
+        value: 5050
