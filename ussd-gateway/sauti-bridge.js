@@ -47,14 +47,14 @@ const MENU = {
 
 const VOICE = {
     en: {
-        langPrompt: 'Sauti Learn. For English press 1. Kwa Kiswahili bonyeza 2. Kwa Gikuyu press 3.',
+        langPrompt: 'Sauti Learn. For English press 1. Kwa Kiswahili bonyeza 2.',
         listen: 'Please ask your question after the beep. Press hash when done.',
         retry: 'I did not hear you. Please ask again after the beep.',
         again: 'Press 1 to ask another question. Press 2 to end.',
         bye: 'Thank you for learning with DeVote. Goodbye.',
     },
     sw: {
-        langPrompt: 'Sauti Learn. Kiingereza bonyeza 1. Kiswahili bonyeza 2. Gikuyu bonyeza 3.',
+        langPrompt: 'Sauti Learn. Kiingereza bonyeza 1. Kiswahili bonyeza 2.',
         listen: 'Uliza swali lako baada ya mlio. Bonyeza reli ukitaka.',
         retry: 'Sikukuskia. Tafadhali uliza tena baada ya mlio.',
         again: 'Bonyeza 1 kuuliza tena. Bonyeza 2 kumaliza.',

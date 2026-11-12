@@ -1593,7 +1593,7 @@ async function handleVoiceRequest(req, res) {
                         : 'IEBC bure: 0800 221 221. Ulaghai: 1195. Tovuti: blockchainvotingsystem026 dot netlify dot app. Kwaheri.'
                 );
             } else if (sauti.isEnabled() && dtmfDigits === '6') {
-                // ── Sauti Learn: choose EN / SW / Gĩkũyũ then talk ──
+                // ── Sauti Learn: choose EN / SW then talk ──
                 session.step = 'SAUTI_LANG';
                 const p = sauti.voicePrompts(lang);
                 xml = voiceXml(p.langPrompt, { numDigits: 1, timeout: 12 });
@@ -1861,9 +1861,9 @@ async function handleVoiceRequest(req, res) {
         }
 
         else if (session.step === 'SAUTI_LANG') {
-            // Sauti Learn: language chosen -> start recording the question
+            // Sauti Learn: language chosen (1=English, 2=Kiswahili) -> start recording
             const choice       = (dtmfDigits || '').trim();
-            const sautiLang    = choice === '2' ? 'sw' : choice === '3' ? 'kik' : 'en';
+            const sautiLang    = choice === '2' ? 'sw' : 'en';
             session.sautiLang  = sautiLang;
             session.step       = 'SAUTI_LISTEN';
             const p            = sauti.voicePrompts(sautiLang);

@@ -2,9 +2,8 @@
 const SAUTI = 'http://localhost:5050';
 
 const CASES = [
-    { lang: 'en', text: 'Your vote is a transaction on the Sepolia blockchain.' },
-    { lang: 'sw', text: 'Kura yako ni muamala kwenye blockchain ya Sepolia.' },
-    { lang: 'kik', text: 'Kura yaku ni muamala kwenye blockchain.' },
+    { lang: 'en', text: 'Your vote is recorded securely on the Sepolia blockchain.' },
+    { lang: 'sw', text: 'Kura yako inarekodiwa kwa usalama kwenye blockchain ya Sepolia.' },
 ];
 
 (async () => {
@@ -15,7 +14,7 @@ const CASES = [
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ text: c.text, lang: c.lang }),
-                signal: AbortSignal.timeout(180000),
+                signal: AbortSignal.timeout(30000),
             });
             const d = await r.json();
             console.log(

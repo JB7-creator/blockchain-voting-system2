@@ -1,20 +1,21 @@
 /**
  * Sauti Learn Service - DeVote Kenya voice-learning module
  * =========================================================
- * Standalone microservice. Languages: English (en), Kiswahili (sw), Gikuyu (kik).
+ * Standalone microservice. Official Languages: English (en), Kiswahili (sw).
  *
- * Routes
- *   GET  /health                      -> service status + which providers are active
- *   GET  /languages                   -> [{code,label,voiceSupported}]
- *   POST /ask        {question,lang}  -> {answer,lang,provider,suggestions}
+ * Routes:
+ *   GET  /health                      -> service status + active providers
+ *   GET  /languages                   -> [{code, label, voiceSupported}]
+ *   POST /ask        {question,lang}  -> {answer, lang, provider, suggestions}
  *   POST /voice/ask  {audioBase64,lang} -> {transcript, answer, tts{audioBase64,mime}}
- *   POST /tts        {text,lang}      -> {audioBase64,mime,provider}
+ *   POST /tts        {text,lang}      -> {audioBase64, mime, provider}
  *   GET  /lesson?topic=&lang=        -> short lesson text (USSD-safe <=182 chars)
  *   GET  /lesson/full?topic=&lang=   -> full lesson text (SMS-safe)
+ *   GET  /topics                      -> topic list for menus
+ *   GET  /suggestions?lang=          -> suggested questions for UI
  *
  * Safety rails: request timeout wrappers, in-memory rate limit, per-question
- * answer cache (cost control), and a guaranteed text answer even with zero
- * API keys configured (offline FAQ mode). No voter PII is ever accepted here.
+ * answer cache, and guaranteed offline FAQ mode. No voter PII is ever accepted.
  */
 
 require('dotenv').config();
@@ -30,9 +31,6 @@ const app = express();
 app.use(express.json({ limit: '12mb' })); // audio payloads arrive base64-encoded
 
 // ── CORS ──────────────────────────────────────────────────────────────────
-// The React app (localhost:3000 in dev, Netlify in prod) calls this service
-// directly from the browser, so cross-origin headers are mandatory.
-// Configure SAUTI_ALLOWED_ORIGINS="https://site.com,http://localhost:3000" in prod.
 const ALLOWED_ORIGINS = (process.env.SAUTI_ALLOWED_ORIGINS || '*')
     .split(',').map(s => s.trim()).filter(Boolean);
 
@@ -52,7 +50,7 @@ app.use((req, res, next) => {
 const PORT = Number(process.env.PORT || 5050);
 const MAX_AUDIO_SECONDS = Number(process.env.SAUTI_MAX_AUDIO_SECONDS || 30);
 
-/* ── Answer cache (same question+language costs one LLM call, not many) ── */
+/* ── Answer cache ────────────────────────────────────────────────────────── */
 const answerCache = new Map();
 const ANSWER_CACHE_TTL_MS = 10 * 60 * 1000;
 const ANSWER_CACHE_MAX = 500;
@@ -75,10 +73,10 @@ function cacheSet(key, value) {
     answerCache.set(key, { at: Date.now(), value });
 }
 
-/* ── Simple per-IP token-bucket guard ─────────────────────────────────────── */
+/* ── Rate limit ──────────────────────────────────────────────────────────── */
 const buckets = new Map();
-const BUCKET_MAX = 60;        // requests ...
-const BUCKET_WINDOW_MS = 60_000; // ... per minute per IP
+const BUCKET_MAX = 60;
+const BUCKET_WINDOW_MS = 60_000;
 
 function rateLimit(req) {
     const ip = req.ip || 'unknown';
@@ -92,12 +90,11 @@ function rateLimit(req) {
     return b.count <= BUCKET_MAX;
 }
 
-/* ── Lesson catalogue shared by /lesson and /lesson/full ──────────────────── */
+/* ── Lesson catalogue ────────────────────────────────────────────────────── */
 function getLesson(topicId, lang) {
     const l = normalizeLang(lang);
     const t0 = FAQ.find(f => f.id === topicId);
     if (!t0) return null;
-    if (l === 'kik') return null; // Gikuyu lessons come from the sidecar only
     return { topic: t0.id, lang: l, text: (t0[l] || t0.en).a };
 }
 
@@ -106,27 +103,26 @@ function getLesson(topicId, lang) {
 app.get('/health', (_req, res) => {
     res.json({
         status: 'Sauti Learn active',
-        version: 1,
-        languages: ['en', 'sw', 'kik'],
+        version: '2.0-bilingual',
+        languages: ['en', 'sw'],
         providers: {
             stt: {
-                google: Boolean(process.env.GOOGLE_STT_API_KEY),
                 groq: Boolean(process.env.GROQ_API_KEY),
+                google: Boolean(process.env.GOOGLE_STT_API_KEY),
                 whisper: Boolean(process.env.OPENAI_API_KEY),
                 azure: Boolean(process.env.AZURE_SPEECH_KEY),
-                kikuyuSidecar: Boolean(process.env.SIDECAR_URL),
             },
             tts: {
                 gemini: Boolean(process.env.GEMINI_API_KEY),
+                elevenlabs: Boolean(process.env.ELEVENLABS_API_KEY),
+                openai: Boolean(process.env.OPENAI_API_KEY),
                 azure: Boolean(process.env.AZURE_SPEECH_KEY),
                 google: Boolean(process.env.GOOGLE_STT_API_KEY),
                 groq: Boolean(process.env.GROQ_API_KEY),
-                kikuyuSidecar: Boolean(process.env.SIDECAR_URL),
             },
             llm: {
                 gemini: Boolean(process.env.GEMINI_API_KEY),
                 groq: Boolean(process.env.GROQ_API_KEY),
-                opencode: Boolean(process.env.OPENCODE_API_KEY && process.env.OPENCODE_MODEL),
                 openai: Boolean(process.env.OPENAI_API_KEY),
                 offlineFaq: true,
             },
@@ -138,9 +134,7 @@ app.get('/languages', (_req, res) => {
     res.json(LANGS.map(code => ({
         code,
         label: LANG_LABELS[code],
-        voiceSupported: code === 'kik'
-            ? Boolean(process.env.SIDECAR_URL)
-            : Boolean(process.env.GOOGLE_STT_API_KEY || process.env.OPENAI_API_KEY || process.env.AZURE_SPEECH_KEY),
+        voiceSupported: Boolean(process.env.GEMINI_API_KEY || process.env.GROQ_API_KEY || process.env.GOOGLE_STT_API_KEY || process.env.OPENAI_API_KEY || process.env.AZURE_SPEECH_KEY),
     })));
 });
 
@@ -164,15 +158,15 @@ app.post('/ask', async (req, res) => {
         console.error('[Sauti] /ask error:', err.message);
         res.status(200).json({
             answer: l === 'sw'
-                ? 'Hitilafu. Jaribu tena au piga 0800 221 221 kwa msaada.'
-                : 'Something went wrong. Please try again, or call 0800 221 221.',
-            lang: 'sw' === l ? 'sw' : 'en',
+                ? 'Hitilafu ndogo imetokea. Tafadhali jaribu tena au piga 0800 221 221 kwa msaada wa bure.'
+                : 'A temporary error occurred. Please try again or call toll-free 0800 221 221.',
+            lang: l,
             provider: 'offline-faq',
         });
     }
 });
 
-// Audio question -> transcript + grounded answer + synthesized audio
+// Audio question -> transcript + answer + synthesized audio
 app.post('/voice/ask', async (req, res) => {
     if (!rateLimit(req)) return res.status(429).json({ error: 'rate_limited' });
     const { audioBase64, lang } = req.body || {};
@@ -181,7 +175,6 @@ app.post('/voice/ask', async (req, res) => {
     const l = normalizeLang(lang);
     const buffer = Buffer.from(String(audioBase64), 'base64');
 
-    // Rough duration guard: 16 kHz, 16-bit mono ≈ 32 KB/s
     if (buffer.length > MAX_AUDIO_SECONDS * 32000) {
         return res.status(413).json({ error: 'audio_too_long', maxSeconds: MAX_AUDIO_SECONDS });
     }
@@ -194,13 +187,10 @@ app.post('/voice/ask', async (req, res) => {
     }
 
     if (!transcript) {
-        // Degrade, never fail: tell the user in their language.
-        const note = l === 'kik'
-            ? 'Sauti haikusikia. Jaribu kwa Kiswahili au andika swali lako.'
-            : l === 'sw'
-                ? 'Sauti haikusikia vizuri. Andika swali lako au jaribu tena.'
-                : 'I could not hear you clearly. Try again, or type your question.';
-        return res.json({ transcript: null, answer: note, lang: l === 'kik' ? 'sw' : l, provider: 'none' });
+        const note = l === 'sw'
+            ? 'Sauti haikusikia vizuri. Tafadhali andika swali lako au jaribu tena baada ya mlio.'
+            : 'I could not hear you clearly. Please try speaking again or type your question.';
+        return res.json({ transcript: null, answer: note, lang: l, provider: 'none' });
     }
 
     try {
@@ -213,8 +203,7 @@ app.post('/voice/ask', async (req, res) => {
             lang: result.lang,
             provider: result.provider,
             suggestions: result.suggestions,
-            degraded: result.degraded,
-            tts, // { audioBase64, mime, provider } or null -> use browser voice
+            tts,
         });
     } catch (err) {
         console.error('[Sauti] /voice/ask error:', err.message);
@@ -222,7 +211,7 @@ app.post('/voice/ask', async (req, res) => {
     }
 });
 
-// Text -> speech (used by the web UI when the browser voice is unavailable)
+// Text -> speech synthesis
 app.post('/tts', async (req, res) => {
     if (!rateLimit(req)) return res.status(429).json({ error: 'rate_limited' });
     const { text, lang } = req.body || {};
@@ -234,7 +223,7 @@ app.post('/tts', async (req, res) => {
     res.json(tts);
 });
 
-// Short lesson text (USSD screens are <=182 chars)
+// Short lesson text (USSD <=182 chars)
 app.get('/lesson', (req, res) => {
     const { topic, lang } = req.query;
     const lesson = getLesson(String(topic || ''), String(lang || 'en'));
@@ -252,17 +241,17 @@ app.get('/lesson/full', (req, res) => {
     res.type('text/plain').send(String(text || '').slice(0, 900));
 });
 
-// Topic catalogue for menus
+// Topic catalogue
 app.get('/topics', (_req, res) => {
     res.json(FAQ.map(f => ({ id: f.id, en: f.en.q, sw: f.sw ? f.sw.q : f.en.q })));
 });
 
-// Suggestions helper for the UI
+// Suggestions helper
 app.get('/suggestions', (req, res) => {
     res.json({ suggestions: suggestionsFor(req.query.lang) });
 });
 
-// JSON body errors -> 400 instead of an express crash trace
+// Error handling
 // eslint-disable-next-line no-unused-vars
 app.use((err, _req, res, _next) => {
     console.error('[Sauti] middleware error:', err.message);
@@ -271,10 +260,10 @@ app.use((err, _req, res, _next) => {
 
 app.listen(PORT, () => {
     console.log(`\n${'═'.repeat(55)}`);
-    console.log(`  🔊 Sauti Learn service`);
+    console.log(`  🔊 Sauti Learn Service (Kenya Civic Voice)`);
     console.log(`  🚀 http://localhost:${PORT}`);
-    console.log(`  🌐 Languages: English / Kiswahili / Gĩkũyũ`);
-    console.log(`  🔌 Providers: ${describeProviders()}`);
+    console.log(`  🌐 Languages: English / Kiswahili`);
+    console.log(`  🔌 Active: ${describeProviders()}`);
     console.log(`${'═'.repeat(55)}\n`);
 });
 
@@ -282,8 +271,7 @@ function describeProviders() {
     const on = [];
     if (process.env.GEMINI_API_KEY) on.push('Gemini');
     if (process.env.GROQ_API_KEY) on.push('Groq');
-    if (process.env.OPENCODE_API_KEY && process.env.OPENCODE_MODEL) on.push('OpenCode');
     if (process.env.OPENAI_API_KEY) on.push('OpenAI');
     if (!on.length) on.push('Offline FAQ');
-    return `LLM[${on.join(', ')}] STT[${Boolean(process.env.GOOGLE_STT_API_KEY || process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY || process.env.AZURE_SPEECH_KEY)}] KikuyuSidecar[${Boolean(process.env.SIDECAR_URL)}]`;
+    return `LLM[${on.join(', ')}] STT[${Boolean(process.env.GROQ_API_KEY || process.env.GOOGLE_STT_API_KEY || process.env.OPENAI_API_KEY || process.env.AZURE_SPEECH_KEY)}] TTS[${Boolean(process.env.GEMINI_API_KEY || process.env.ELEVENLABS_API_KEY || process.env.OPENAI_API_KEY || process.env.GROQ_API_KEY || process.env.AZURE_SPEECH_KEY)}]`;
 }
