@@ -394,27 +394,30 @@ function getPositionName(posIndex, lang) {
 
 const I18N = {
     en: {
-        welcome: `CON DeVote Kenya 🗳️
+        welcome: `CON Welcome to DeVote
+Decentralized Voting Gateway
+
 1. Vote Now
 2. My Status
 3. View Candidates
 4. Live Results
-5. IEBC Help`,
+5. Help`,
         enterId: `CON Enter your 8-digit National ID:`,
-        enterPin: (name) => `CON Hello ${name}!
+        enterPin: (name) => `CON Hello ${name},
 Enter your 4-digit PIN:`,
-        wrongPin: `END Wrong PIN. Session locked.
-Call again to retry.`,
-        alreadyVotedAll: (c) => `END All 6 ballots cast! ✓
-Pres:${c[0]||'✓'} Gov:${c[1]||'✓'}
-Sen:${c[2]||'✓'} WR:${c[3]||'✓'}
-MP:${c[4]||'✓'} MCA:${c[5]||'✓'}
-Blockchain secured. ${SITE_URL}`,
+        wrongPin: `END Incorrect PIN. Session closed.
+Please redial to try again.`,
+        alreadyVotedAll: (c) => `END All 6 ballots cast.
+Pres: Cast | Gov: Cast
+Sen: Cast  | WR: Cast
+MP: Cast   | MCA: Cast
+Secured on blockchain.
+Web: ${SITE_URL}`,
         alreadyVotedPos: (pos, statusArr) => {
             const labels = ['President', 'Governor', 'Senator', 'Woman Rep', 'MP', 'MCA'];
-            let m = `CON ⚠️ Already voted for ${pos}!\nSelect another position:\n`;
+            let m = `CON Position already voted: ${pos}\nSelect another position:\n--------------------\n`;
             labels.forEach((l, i) => {
-                m += `${i + 1}. ${statusArr && statusArr[i] ? '✓ ' : ''}${l}\n`;
+                m += `${i + 1}. ${l}${statusArr && statusArr[i] ? ' [Voted]' : ''}\n`;
             });
             m += `0. Back`;
             return m;
@@ -423,108 +426,137 @@ Blockchain secured. ${SITE_URL}`,
             const labels = ['President', 'Governor', 'Senator', 'Woman Rep', 'MP', 'MCA'];
             let m = 'CON ';
             if (lastRecorded) {
-                m += `✓ ${lastRecorded} recorded!\n━━━━━━━━━━━━━━━━━━━━\nSelect next position:\n`;
+                m += `${lastRecorded} vote recorded.\n--------------------\nSelect Next Ballot:\n`;
             } else {
-                m += `Select Election Position:\n`;
+                m += `Select Position to Vote:\n--------------------\n`;
             }
             labels.forEach((l, i) => {
-                m += `${i + 1}. ${statusArr && statusArr[i] ? '✓ ' : ''}${l}\n`;
+                m += `${i + 1}. ${l}${statusArr && statusArr[i] ? ' [Voted]' : ''}\n`;
             });
             m += `0. Back`;
             return m;
         },
         ballot: (num, pos, cands) => {
-            let m = `CON Ballot ${num}/6: Select ${pos}:\n`;
+            let m = `CON Ballot ${num}/6: Select ${pos}\n--------------------\n`;
             cands.forEach((c, i) => { m += `${i + 1}. ${c.name}\n`; });
             m += `0. Back`;
             return m;
         },
-        confirmBallot: (num, pos, cand) => `CON Confirm Ballot (${num}/6):
-━━━━━━━━━━━━━━━━━━━━
+        confirmBallot: (num, pos, cand) => `CON Confirm Ballot (${num}/6)
+--------------------
 Position : ${pos}
 Candidate: ${cand}
-━━━━━━━━━━━━━━━━━━━━
-1. Yes, Confirm Vote ✓
+--------------------
+1. Confirm Vote
 2. Change Candidate
 0. Back`,
-        ballotRecorded: (num, pos) => `CON ✓ ${pos} recorded!
+        ballotRecorded: (num, pos) => `CON ${pos} vote recorded.
 Ballot ${num}/6 saved.
-Press 1 to continue`,
-        allDone: `END ✅ All 6 ballots cast!
-Blockchain receipt sent via SMS.
-Full results: ${SITE_URL}`,
-        exitVoting: `END Session saved.
-Remaining ballots open next session.
+1. Continue`,
+        allDone: `END All 6 ballots cast successfully.
+Receipt sent via SMS.
+Tallies: ${SITE_URL}`,
+        exitVoting: `END Session paused.
+Remaining ballots can be cast anytime.
 ${SITE_URL}`,
         invalidCand: `CON Invalid choice.
-Press the number next to your candidate:`,
+Enter candidate number:`,
         enterIdStatus: `CON Enter National ID:
-(0 to Back)`,
+(0. Back)`,
         statusResult: (name, id, county, constit, reg, sv) =>
-            `END ${name} [${id}]
-${county}/${constit}
-Status: ${reg ? 'Registered ✓' : 'Not Registered'}
-Ballots: ${sv}/6 cast`,
-        selectPosCand: `CON View candidates for:
-1.President 2.Governor
-3.Senator  4.Woman Rep
-5.MP       6.MCA
-0.Back`,
+            `END Voter: ${name} (${id})
+Area: ${county} / ${constit}
+Status: ${reg ? 'Approved' : 'Pending'}
+Ballots Cast: ${sv}/6
+Web: ${SITE_URL}`,
+        selectPosCand: `CON View Candidates:
+1. President
+2. Governor
+3. Senator
+4. Woman Rep
+5. MP
+6. MCA
+0. Back`,
         candList: (pos, list) => {
-            let m = `END ${pos} candidates:\n`;
-            list.forEach((c, i) => { m += `${i + 1}.${c.name}\n`; });
-            m += `Results: ${SITE_URL}`;
+            let m = `END Candidates: ${pos}\n--------------------\n`;
+            list.forEach((c, i) => { m += `${i + 1}. ${c.name}\n`; });
+            m += `--------------------\nWeb: ${SITE_URL}`;
             return m;
         },
         enterIdResults: `CON Enter National ID for
-area results (0 to Back):`,
+area live results (0. Back):`,
         areaConfirm: (county, constit, ward) =>
-            `CON Your Registered Area:\n📍${county}\n   ${constit} / ${ward}\nSelect position:\n1.President  2.Governor\n3.Senator    4.Woman Rep\n5.MP         6.MCA\n0.Back`,
+            `CON Registered Area:
+${county} | ${constit} | ${ward}
+--------------------
+Select position:
+1. President
+2. Governor
+3. Senator
+4. Woman Rep
+5. MP
+6. MCA
+0. Back`,
         resultsOut: (pos, scopeLabel, areaName, list, age) => {
-            let m = `END 📊 ${pos} Results\n📍${scopeLabel}: ${areaName}\n🕐 Updated ${age}\n${'─'.repeat(18)}\n`;
-            list.forEach((c, i) => {
-                const bar = '█'.repeat(Math.min(i === 0 ? 5 : Math.max(1, Math.round((c.voteCount / (list[0].voteCount || 1)) * 5)), 5));
-                m += `${i + 1}.${c.name}\n  ${bar} ${c.voteCount} votes\n`;
-            });
-            m += `Full: ${SITE_URL}`;
+            const total = list.reduce((sum, c) => sum + (c.voteCount || 0), 0);
+            let m = `END Results: ${pos}\nArea: ${areaName} (${scopeLabel})\nUpdated: ${age}\n--------------------\n`;
+            if (list.length === 0 || total === 0) {
+                list.forEach((c, i) => {
+                    m += `${i + 1}. ${c.name}: 0 votes (0%)\n`;
+                });
+            } else {
+                list.forEach((c, i) => {
+                    const pct = Math.round(((c.voteCount || 0) / total) * 100);
+                    m += `${i + 1}. ${c.name}: ${c.voteCount || 0} (${pct}%)\n`;
+                });
+            }
+            m += `--------------------\nTotal Votes: ${total}\nWeb: ${SITE_URL}`;
             return m;
         },
-        noResults: (pos, area) => `END No results yet for\n${pos} in ${area}.\nCheck: ${SITE_URL}`,
-        help: `END IEBC DeVote Help:
+        noResults: (pos, area) => `END No votes recorded yet for
+${pos} in ${area}.
+Tallies: ${SITE_URL}`,
+        help: `END IEBC DeVote Support:
 Toll-Free: 0800 221 221
-Fraud: 1195
-Web: ${SITE_URL}`,
-        invalidOption: `CON Invalid. Select:
-1.Vote 2.Status
-3.Candidates 4.Results
-5.Help`,
-        error: `END Technical error. Try again.\n${SITE_URL}`,
-        notRegistered: (id) => `END ID ${id} not registered.
+Helpline: 1195
+Website: ${SITE_URL}`,
+        invalidOption: `CON Invalid choice. Select:
+1. Vote Now
+2. My Status
+3. Candidates
+4. Live Results
+5. Help`,
+        error: `END System error. Please try again.
+${SITE_URL}`,
+        notRegistered: (id) => `END ID ${id} is not registered.
 Register at: ${SITE_URL}
-Then dial again to vote.`,
+Then redial to cast your ballot.`,
     },
     sw: {
-        welcome: `CON DeVote Kenya 🗳️
+        welcome: `CON Karibu DeVote
+Mfumo Salama wa Kura
+
 1. Piga Kura
-2. Usajili Wangu
+2. Hali Yangu
 3. Wagombea
-4. Matokeo Moja kwa Moja
-5. Msaada IEBC`,
+4. Matokeo
+5. Msaada`,
         enterId: `CON Ingiza Nambari ya Kitambulisho (tarakimu 8):`,
-        enterPin: (name) => `CON Hujambo ${name}!
+        enterPin: (name) => `CON Hujambo ${name},
 Ingiza PIN yako (tarakimu 4):`,
         wrongPin: `END PIN si sahihi. Kikao kimefungwa.
-Piga tena kuendelea.`,
-        alreadyVotedAll: (c) => `END Kura zote 6 zimepigwa! ✓
-Rais:${c[0]||'✓'} Gov:${c[1]||'✓'}
-Sen:${c[2]||'✓'} WR:${c[3]||'✓'}
-MB:${c[4]||'✓'} MCA:${c[5]||'✓'}
-Blockchain inalinda. ${SITE_URL}`,
+Tafadhali piga tena.`,
+        alreadyVotedAll: (c) => `END Kura zote 6 zimekamilika.
+Rais: Sawa | Gavana: Sawa
+Seneta: Sawa | WR: Sawa
+Mbunge: Sawa | MCA: Sawa
+Zimelindwa kwenye blockchain.
+Tovuti: ${SITE_URL}`,
         alreadyVotedPos: (pos, statusArr) => {
             const labels = ['Rais', 'Gavana', 'Seneta', 'Woman Rep', 'Mbunge', 'Diwani'];
-            let m = `CON ⚠️ Umeshapiga kura ya ${pos}!\nChagua nafasi nyingine:\n`;
+            let m = `CON Umeshapiga kura ya ${pos}.\nChagua nafasi nyingine:\n--------------------\n`;
             labels.forEach((l, i) => {
-                m += `${i + 1}. ${statusArr && statusArr[i] ? '✓ ' : ''}${l}\n`;
+                m += `${i + 1}. ${l}${statusArr && statusArr[i] ? ' [Imepigwa]' : ''}\n`;
             });
             m += `0. Rudi`;
             return m;
@@ -533,84 +565,110 @@ Blockchain inalinda. ${SITE_URL}`,
             const labels = ['Rais', 'Gavana', 'Seneta', 'Woman Rep', 'Mbunge', 'Diwani'];
             let m = 'CON ';
             if (lastRecorded) {
-                m += `✓ Kura ya ${lastRecorded} imerekodiwa!\n━━━━━━━━━━━━━━━━━━━━\nChagua kura inayofuata:\n`;
+                m += `Kura ya ${lastRecorded} imerekodiwa.\n--------------------\nChagua Kura Inayofuata:\n`;
             } else {
-                m += `Chagua Nafasi ya Uchaguzi:\n`;
+                m += `Chagua Nafasi ya Kura:\n--------------------\n`;
             }
             labels.forEach((l, i) => {
-                m += `${i + 1}. ${statusArr && statusArr[i] ? '✓ ' : ''}${l}\n`;
+                m += `${i + 1}. ${l}${statusArr && statusArr[i] ? ' [Imepigwa]' : ''}\n`;
             });
             m += `0. Rudi`;
             return m;
         },
         ballot: (num, pos, cands) => {
-            let m = `CON Kura ${num}/6: Chagua ${pos}:\n`;
+            let m = `CON Kura ${num}/6: Chagua ${pos}\n--------------------\n`;
             cands.forEach((c, i) => { m += `${i + 1}. ${c.name}\n`; });
             m += `0. Rudi`;
             return m;
         },
-        confirmBallot: (num, pos, cand) => `CON Thibitisha Kura (${num}/6):
-━━━━━━━━━━━━━━━━━━━━
+        confirmBallot: (num, pos, cand) => `CON Thibitisha Kura (${num}/6)
+--------------------
 Nafasi  : ${pos}
 Mgombea : ${cand}
-━━━━━━━━━━━━━━━━━━━━
-1. Ndio, Thibitisha ✓
+--------------------
+1. Thibitisha Kura
 2. Badilisha Mgombea
 0. Rudi`,
-        ballotRecorded: (num, pos) => `CON ✓ ${pos} imerekodiwa!
+        ballotRecorded: (num, pos) => `CON Kura ya ${pos} imerekodiwa.
 Kura ${num}/6 imehifadhiwa.
-Bonyeza 1 kuendelea`,
-        allDone: `END ✅ Kura zote 6 zimepigwa!
-Risiti ya blockchain imetumwa SMS.
-Matokeo kamili: ${SITE_URL}`,
+1. Endelea`,
+        allDone: `END Kura zote 6 zimekamilika.
+Ujumbe wa uthibitisho umetumwa SMS.
+Matokeo: ${SITE_URL}`,
         exitVoting: `END Kikao kimehifadhiwa.
 Kura zilizobaki zinaweza kupigwa baadaye.
 ${SITE_URL}`,
         invalidCand: `CON Chaguo batili.
-Bonyeza nambari ya mgombea wako:`,
+Ingiza nambari ya mgombea:`,
         enterIdStatus: `CON Ingiza Nambari ya Kitambulisho:
-(0 Kurudi)`,
+(0. Rudi)`,
         statusResult: (name, id, county, constit, reg, sv) =>
-            `END ${name} [${id}]
-${county}/${constit}
-Hali: ${reg ? 'Umesajiliwa ✓' : 'Haijasajiliwa'}
-Kura: ${sv}/6 zilizopigwa`,
-        selectPosCand: `CON Tazama wagombea wa:
-1.Rais    2.Gavana
-3.Seneta  4.Woman Rep
-5.Mbunge  6.Diwani
-0.Rudi`,
+            `END Mpigakura: ${name} (${id})
+Eneo: ${county} / ${constit}
+Hali: ${reg ? 'Imesajiliwa' : 'Inasubiri'}
+Kura Zilizopigwa: ${sv}/6
+Tovuti: ${SITE_URL}`,
+        selectPosCand: `CON Tazama Wagombea:
+1. Rais
+2. Gavana
+3. Seneta
+4. Woman Rep
+5. Mbunge
+6. Diwani
+0. Rudi`,
         candList: (pos, list) => {
-            let m = `END Wagombea wa ${pos}:\n`;
-            list.forEach((c, i) => { m += `${i + 1}.${c.name}\n`; });
-            m += `Matokeo: ${SITE_URL}`;
+            let m = `END Wagombea: ${pos}\n--------------------\n`;
+            list.forEach((c, i) => { m += `${i + 1}. ${c.name}\n`; });
+            m += `--------------------\nTovuti: ${SITE_URL}`;
             return m;
         },
         enterIdResults: `CON Ingiza Kitambulisho kuona
-matokeo ya eneo lako (0 Rudi):`,
+matokeo ya eneo (0. Rudi):`,
         areaConfirm: (county, constit, ward) =>
-            `CON Eneo Lako:\n📍${county}\n   ${constit} / ${ward}\nChagua nafasi:\n1.Rais       2.Gavana\n3.Seneta     4.Woman Rep\n5.Mbunge     6.Diwani\n0.Rudi`,
+            `CON Eneo Lako:
+${county} | ${constit} | ${ward}
+--------------------
+Chagua nafasi:
+1. Rais
+2. Gavana
+3. Seneta
+4. Woman Rep
+5. Mbunge
+6. Diwani
+0. Rudi`,
         resultsOut: (pos, scopeLabel, areaName, list, age) => {
-            let m = `END 📊 Matokeo: ${pos}\n📍${scopeLabel}: ${areaName}\n🕐 Sasishwa ${age}\n${'─'.repeat(18)}\n`;
-            list.forEach((c, i) => {
-                const bar = '█'.repeat(Math.min(i === 0 ? 5 : Math.max(1, Math.round((c.voteCount / (list[0].voteCount || 1)) * 5)), 5));
-                m += `${i + 1}.${c.name}\n  ${bar} ${c.voteCount} kura\n`;
-            });
-            m += `Kamili: ${SITE_URL}`;
+            const total = list.reduce((sum, c) => sum + (c.voteCount || 0), 0);
+            let m = `END Matokeo: ${pos}\nEneo: ${areaName} (${scopeLabel})\nSasishwa: ${age}\n--------------------\n`;
+            if (list.length === 0 || total === 0) {
+                list.forEach((c, i) => {
+                    m += `${i + 1}. ${c.name}: kura 0 (0%)\n`;
+                });
+            } else {
+                list.forEach((c, i) => {
+                    const pct = Math.round(((c.voteCount || 0) / total) * 100);
+                    m += `${i + 1}. ${c.name}: kura ${c.voteCount || 0} (${pct}%)\n`;
+                });
+            }
+            m += `--------------------\nJumla ya Kura: ${total}\nTovuti: ${SITE_URL}`;
             return m;
         },
-        noResults: (pos, area) => `END Hakuna matokeo bado\n${pos} - ${area}.\nAngalia: ${SITE_URL}`,
+        noResults: (pos, area) => `END Hakuna kura zilizorekodiwa
+bado kwa ${pos} eneo la ${area}.
+Tovuti: ${SITE_URL}`,
         help: `END IEBC DeVote Msaada:
 Bure: 0800 221 221
 Ulaghai: 1195
 Tovuti: ${SITE_URL}`,
         invalidOption: `CON Chaguo batili. Chagua:
-1.Kura 2.Usajili
-3.Wagombea 4.Matokeo
-5.Msaada`,
-        error: `END Hitilafu ya kiufundi. Jaribu tena.\n${SITE_URL}`,
-        notRegistered: (id) => `END Kitambulisho ${id} hakisajiliwa.
-Jisajili: ${SITE_URL}
+1. Piga Kura
+2. Hali ya Usajili
+3. Wagombea
+4. Matokeo
+5. Msaada`,
+        error: `END Hitilafu ya kiufundi. Tafadhali jaribu tena.
+${SITE_URL}`,
+        notRegistered: (id) => `END Kitambulisho ${id} hakijasajiliwa.
+Jisajili kupitia: ${SITE_URL}
 Kisha piga tena kupiga kura.`,
     }
 };
@@ -984,15 +1042,17 @@ async function handleUssdRequest(req, res) {
     try {
         // ── Level 0: Language Selection ──────────────────────
         if (inputs.length === 0) {
-            response = `CON Welcome to DeVote Kenya / Karibu
-Chagua / Select:
+            response = `CON Welcome to DeVote
+Decentralized Voting System
+
+Select Language / Chagua:
 1. English
 2. Kiswahili`;
         }
 
         // Validate language
         else if (inputs[0] !== '1' && inputs[0] !== '2') {
-            response = `CON Invalid / Chaguo batili
+            response = `CON Select Language / Chagua:
 1. English
 2. Kiswahili`;
         }
@@ -2014,8 +2074,8 @@ async function sendSms(phoneNumber, candidateName, positionName, txHash, lang = 
     const explorerUrl = `https://sepolia.etherscan.io/tx/${txHash}`;
     const isEn = lang === 'en';
     const msg =
-`DeVote Kenya ✓
-${isEn ? 'Vote Recorded!' : 'Kura Imerekodiwa!'}
+`DeVote Kenya
+${isEn ? 'Vote Recorded' : 'Kura Imerekodiwa'}
 ${isEn ? 'Position' : 'Nafasi'}: ${positionName}
 ${isEn ? 'Candidate' : 'Mgombea'}: ${candidateName}
 Tx: ${txHash.slice(0, 16)}...
