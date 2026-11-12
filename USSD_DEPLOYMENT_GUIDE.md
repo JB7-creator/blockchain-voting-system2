@@ -1,5 +1,5 @@
 # DeVote Kenya — Complete USSD & Bulk SMS Gateway Guide
-**Live System Frontend:** [https://blockchainvotingsystem026.netlify.app](https://blockchainvotingsystem026.netlify.app)  
+**Live System Frontend:** [https://blockchainelectionsystem.netlify.app](https://blockchainelectionsystem.netlify.app)  
 **Smart Contract (Ethereum Sepolia):** `0xc1dd7A144Ec21088630637a5978cadF51b34931E`  
 **Africa's Talking Dial Code:** `*384*41484#` (Channel: `41484`)  
 **Current Active Live Callback:** `https://electro-housing-propose-validity.trycloudflare.com/ussd`

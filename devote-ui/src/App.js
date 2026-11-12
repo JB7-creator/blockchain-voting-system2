@@ -287,7 +287,7 @@ function App() {
               onClick={() => handleNavigate('sauti')}
               className="px-4 py-2 bg-dark-green-600 hover:bg-dark-green-700 text-white rounded-lg text-sm font-medium transition-colors"
             >
-              🔊 Open Sauti Learn
+              Open Sauti Learn
             </button>
           )}
         </div>

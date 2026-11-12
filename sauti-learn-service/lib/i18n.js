@@ -29,12 +29,12 @@ const I18N = {
             'What do I need on voting day?',
         ],
         lessons: {
-            register: 'To register: click "Sign In to Vote", connect your wallet, and fill in your National ID, phone number, county, constituency, and ward. An election administrator verifies your details, and you are ready to vote.',
+            register: 'To register: open blockchainelectionsystem.netlify.app, click "Sign In to Vote", connect your wallet, and fill in your National ID, phone number, county, constituency, and ward. An election administrator verifies your details, and you are ready to vote.',
             positions: 'There are 6 leadership ballots: President, Governor, Senator, Woman Representative, MP (Member of Parliament), and MCA (Ward Representative). You can cast one vote for each position.',
             onchain: 'Every ballot cast creates a secure, tamper-proof record on the blockchain. You receive an instant SMS receipt with your transaction verification code.',
             secret: 'Yes! Your vote is completely secret. The system records only that your registered wallet voted, never who you selected. Nobody—not even the administrators—can see your choices.',
-            ussd: 'No smartphone or internet? No problem! You can dial the DeVote USSD code from any simple mobile phone, enter your National ID and 4-digit PIN, and vote easily in minutes.',
-            day: 'On voting day, make sure you have your National ID and your secret 4-digit PIN. Polling is open from 6:00 AM to 5:00 PM. Dial the USSD code or open the web app to cast your ballot.',
+            ussd: 'No smartphone or internet? No problem! You can dial the official DeVote USSD code *384*41484# from any simple mobile phone, enter your National ID and 4-digit PIN, and vote easily in minutes.',
+            day: 'On voting day, make sure you have your National ID and your secret 4-digit PIN. Polling is open from 6:00 AM to 5:00 PM. Dial *384*41484# or visit blockchainelectionsystem.netlify.app to cast your ballot.',
         },
     },
     sw: {
@@ -53,12 +53,12 @@ const I18N = {
             'Nahitaji nini siku ya kupiga kura?',
         ],
         lessons: {
-            register: 'Kujisajili: fungua DeVote, bonyeza "Ingia Kupiga Kura", unganisha wallet, kisha jaza Nambari ya Kitambulisho, simu, kaunti, eneo bunge na kata. Msimamizi atakagua na kuthibitisha usajili wako tayari kupiga kura.',
+            register: 'Kujisajili: fungua wavuti ya blockchainelectionsystem.netlify.app, bonyeza "Ingia Kupiga Kura", unganisha wallet, kisha jaza Nambari ya Kitambulisho, simu, kaunti, eneo bunge na kata. Msimamizi atakagua na kuthibitisha usajili wako tayari kupiga kura.',
             positions: 'Kuna kura 6 za uongozi: Rais, Gavana, Seneta, Mwakilishi wa Wanawake, Mbunge na Diwani (MCA). Kila nafasi una haki ya kupiga kura moja pekee.',
             onchain: 'Kila kura unayopiga inarekodiwa kwenye daftari salama la kidijitali (blockchain) lisiloweza kubadilishwa wala kufutwa. Unapata risiti ya papo hapo kwa SMS yenye nambari ya uthibitisho.',
             secret: 'Ndiyo! Kura yako ni siri kamili. Mfumo unarekodi tu kuwa umepiga kura, lakini haurekodi ni mgombea yupi uliyemchagua. Hakuna mtu anayeweza kujua kura yako.',
-            ussd: 'Huna simu mahiri au mtandao? Hakuna shida! Unaweza kupiga msimbo wa USSD wa DeVote kutoka simu yoyote ya kawaida (mulika mwizi), weka Kitambulisho na PIN yako ya siri, na upige kura kwa dakika chache.',
-            day: 'Siku ya kupiga kura, hakikisha una Kitambulisho chako cha Kitaifa na PIN yako ya siri ya tarakimu 4. Vituo hufunguliwa saa 12:00 asubuhi hadi 11:00 jioni. Piga kura kupitia USSD au wavuti.',
+            ussd: 'Huna simu mahiri au mtandao? Hakuna shida! Unaweza kupiga msimbo rasmi wa USSD *384*41484# kutoka simu yoyote ya kawaida (mulika mwizi), weka Kitambulisho na PIN yako ya siri, na upige kura kwa dakika chache.',
+            day: 'Siku ya kupiga kura, hakikisha una Kitambulisho chako cha Kitaifa na PIN yako ya siri ya tarakimu 4. Vituo hufunguliwa saa 12:00 asubuhi hadi 11:00 jioni. Piga kura kupitia USSD *384*41484# au wavuti blockchainelectionsystem.netlify.app.',
         },
     },
 };

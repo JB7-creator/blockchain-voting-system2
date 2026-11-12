@@ -16,11 +16,11 @@ const FAQ = [
         ],
         en: {
             q: 'How do I register to vote?',
-            a: 'Open the DeVote app, click "Sign In to Vote", connect your wallet, and fill in your National ID, phone number, county, constituency, and ward. An election administrator verifies and approves your registration, and then you are ready to vote.',
+            a: 'Open blockchainelectionsystem.netlify.app, click "Sign In to Vote", connect your wallet, and fill in your National ID, phone number, county, constituency, and ward. An election administrator verifies and approves your registration, and then you are ready to vote.',
         },
         sw: {
             q: 'Ninajisajilishaje kupiga kura?',
-            a: 'Fungua wavuti ya DeVote, bonyeza "Ingia Kupiga Kura", unganisha wallet yako, kisha jaza Nambari ya Kitambulisho, simu, kaunti, eneo bunge na kata. Msimamizi atakagua na kuthibitisha usajili wako tayari kupiga kura.',
+            a: 'Fungua wavuti ya blockchainelectionsystem.netlify.app, bonyeza "Ingia Kupiga Kura", unganisha wallet yako, kisha jaza Nambari ya Kitambulisho, simu, kaunti, eneo bunge na kata. Msimamizi atakagua na kuthibitisha usajili wako tayari kupiga kura.',
         },
     },
     {
@@ -84,11 +84,11 @@ const FAQ = [
         ],
         en: {
             q: 'How do I vote without internet or a smartphone?',
-            a: 'You can vote from any basic mobile phone by dialing the DeVote USSD code. Enter your National ID and your secret 4-digit PIN, then follow the numbered prompts on your screen to cast your vote. No data or internet required!',
+            a: 'You can vote from any basic mobile phone by dialing the official DeVote USSD code *384*41484#. Enter your National ID and your secret 4-digit PIN, then follow the numbered prompts on your screen to cast your vote. No data or internet required!',
         },
         sw: {
             q: 'Ninapigaje kura bila mtandao au simu ndogo?',
-            a: 'Unaweza kupiga kura kutoka simu yoyote ya kawaida (hata mulika mwizi) kwa kupiga msimbo wa USSD wa DeVote. Weka Kitambulisho na PIN yako ya siri, kisha fuata maagizo ya nambari kupiga kura. Huhitaji bando wala intaneti!',
+            a: 'Unaweza kupiga kura kutoka simu yoyote ya kawaida (hata mulika mwizi) kwa kupiga msimbo rasmi wa USSD *384*41484#. Weka Kitambulisho na PIN yako ya siri, kisha fuata maagizo ya nambari kupiga kura. Huhitaji bando wala intaneti!',
         },
     },
     {

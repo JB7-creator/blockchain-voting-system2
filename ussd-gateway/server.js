@@ -2,7 +2,7 @@
  * DeVote Kenya - USSD & Bulk SMS Blockchain Gateway v3
  * ======================================================
  * Connects Africa's Talking USSD → Ethereum Sepolia → Firebase
- * Site: https://blockchainvotingsystem026.netlify.app
+ * Site: https://blockchainelectionsystem.netlify.app
  *
  * KEY FEATURES:
  * - Bilingual support: English & Kiswahili
@@ -44,7 +44,7 @@ const RPC_URL             = process.env.RPC_URL || 'https://rpc.sepolia.org';
 const CONTRACT_ADDRESS    = process.env.CONTRACT_ADDRESS || '0xc1dd7A144Ec21088630637a5978cadF51b34931E';
 const RELAYER_PRIVATE_KEY = process.env.RELAYER_PRIVATE_KEY || '';
 const VOTER_SALT          = process.env.VOTER_SALT || 'kenya-elections-sepolia-digital-trust-2026';
-const SITE_URL            = 'https://blockchainvotingsystem026.netlify.app';
+const SITE_URL            = 'https://blockchainelectionsystem.netlify.app';
 
 // ─────────────────────────────────────────────────────────────
 // KENYA COUNTY CODE → NAME MAPPING
@@ -1589,8 +1589,8 @@ async function handleVoiceRequest(req, res) {
                 voiceSessions.delete(sessionId);
                 xml = voiceXml(
                     lang === 'en'
-                        ? 'IEBC toll-free: 0800 221 221. Fraud hotline: 1195. Website: blockchainvotingsystem026 dot netlify dot app. Goodbye.'
-                        : 'IEBC bure: 0800 221 221. Ulaghai: 1195. Tovuti: blockchainvotingsystem026 dot netlify dot app. Kwaheri.'
+                        ? 'IEBC toll-free: 0800 221 221. Fraud hotline: 1195. Website: blockchainelectionsystem dot netlify dot app. Goodbye.'
+                        : 'IEBC bure: 0800 221 221. Ulaghai: 1195. Tovuti: blockchainelectionsystem dot netlify dot app. Kwaheri.'
                 );
             } else if (sauti.isEnabled() && dtmfDigits === '6') {
                 // ── Sauti Learn: choose EN / SW then talk ──
@@ -1840,7 +1840,7 @@ async function handleVoiceRequest(req, res) {
                 if (filtered.length === 0) {
                     xml = voiceXml(
                         session.lang === 'en'
-                            ? `No results yet for ${posName} in ${area}. Visit blockchainvotingsystem026 dot netlify dot app. Goodbye.`
+                            ? `No results yet for ${posName} in ${area}. Visit blockchainelectionsystem dot netlify dot app. Goodbye.`
                             : `Hakuna matokeo bado kwa ${posName} katika ${area}. Tembelea tovuti. Kwaheri.`
                     );
                 } else {

@@ -2,16 +2,104 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { SAUTI_LANGS, copyFor } from './sautiContent';
 
 /**
- * Sauti Learn - Bilingual Voter Education Voice Guide (Kiswahili & English)
- * Connects to the standalone `sauti-learn-service` (REACT_APP_SAUTI_URL).
- *
- * Designed for Kenyan voters:
- *  - Native browser Web Speech API live captions (sw-KE / en-KE)
- *  - Animated audio waveform and microphone level visualizer
- *  - Spoken answers via server TTS (Gemini/Groq/OpenAI) with fallback to device voice
- *  - Interactive quick lessons with one-click "Listen to Lesson" audio
- *  - Resilient local FAQ fallback if the microservice is offline
+ * Clean SVG Vector Icons (No AI emojis)
  */
+const Icons = {
+  Mic: ({ className = "w-6 h-6" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M19 11a7 7 0 01-14 0m14 0a7 7 0 00-7-7m7 7v4a3 3 0 01-3 3H7a3 3 0 01-3-3v-4m14 0h2m-16 0H3m8 8v3m0 0h-3m3 0h3" />
+    </svg>
+  ),
+  Stop: ({ className = "w-6 h-6" }) => (
+    <svg className={className} fill="currentColor" viewBox="0 0 24 24">
+      <rect x="6" y="6" width="12" height="12" rx="2" />
+    </svg>
+  ),
+  Speaker: ({ className = "w-5 h-5" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+    </svg>
+  ),
+  Mute: ({ className = "w-5 h-5" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2" />
+    </svg>
+  ),
+  Send: ({ className = "w-4 h-4" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+    </svg>
+  ),
+  Phone: ({ className = "w-5 h-5" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" />
+    </svg>
+  ),
+  Shield: ({ className = "w-5 h-5" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+    </svg>
+  ),
+  Document: ({ className = "w-5 h-5" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+    </svg>
+  ),
+  Ballot: ({ className = "w-5 h-5" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
+    </svg>
+  ),
+  Receipt: ({ className = "w-5 h-5" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M9 5H7a2 2 0 00-2 2v12l2-1 2 1 2-1 2 1 2-1 2 1 2-1v-12a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+    </svg>
+  ),
+  Clock: ({ className = "w-5 h-5" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+  ),
+  Help: ({ className = "w-5 h-5" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M18.364 5.636l-3.536 3.536m0 5.656l3.536 3.536M9.172 9.172L5.636 5.636m3.536 9.192l-3.536 3.536M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-5 0a4 4 0 11-8 0 4 4 0 018 0z" />
+    </svg>
+  ),
+  Book: ({ className = "w-5 h-5" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+    </svg>
+  ),
+  Sparkles: ({ className = "w-4 h-4" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" />
+    </svg>
+  ),
+  Check: ({ className = "w-4 h-4" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+    </svg>
+  ),
+  Info: ({ className = "w-5 h-5" }) => (
+    <svg className={className} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+    </svg>
+  ),
+};
+
+function renderTopicIcon(iconName, className = "w-5 h-5") {
+  switch (iconName) {
+    case 'register': return <Icons.Document className={className} />;
+    case 'positions': return <Icons.Ballot className={className} />;
+    case 'ussd': return <Icons.Phone className={className} />;
+    case 'secret': return <Icons.Shield className={className} />;
+    case 'verify': return <Icons.Receipt className={className} />;
+    case 'day': return <Icons.Clock className={className} />;
+    case 'help': return <Icons.Help className={className} />;
+    default: return <Icons.Book className={className} />;
+  }
+}
 
 const SAUTI_URL = (process.env.REACT_APP_SAUTI_URL || 'http://localhost:5050').replace(/\/$/, '');
 
@@ -75,7 +163,6 @@ const SautiLearnPage = ({ onNavigate }) => {
   // Web Speech & MediaRecorder capability check
   useEffect(() => {
     const hasMedia = typeof window !== 'undefined' && navigator.mediaDevices && typeof window.MediaRecorder !== 'undefined';
-    const SR = typeof window !== 'undefined' && (window.SpeechRecognition || window.webkitSpeechRecognition);
     setVoiceSupported(Boolean(hasMedia));
   }, []);
 
@@ -100,7 +187,7 @@ const SautiLearnPage = ({ onNavigate }) => {
       window.speechSynthesis.cancel();
       const utter = new SpeechSynthesisUtterance(text);
       utter.lang = langCode === 'sw' ? 'sw-KE' : 'en-KE';
-      utter.rate = 0.95; // slightly slower cadence for clearer civic comprehension
+      utter.rate = 0.95;
       utter.onend = () => setStatus('done');
       utter.onerror = () => setStatus('done');
       setStatus('speaking');
@@ -183,7 +270,6 @@ const SautiLearnPage = ({ onNavigate }) => {
       setStatus('done');
       ttsAndSpeak(resolvedAnswer, data.lang || lang);
     } catch (_) {
-      // Offline fallback: answer directly from curated lessons
       const fallback = getLocalFallbackAnswer(trimmed, lang);
       setAnswer(fallback);
       setStatus('done');
@@ -191,7 +277,7 @@ const SautiLearnPage = ({ onNavigate }) => {
     }
   };
 
-  // Local fallback answer if backend is completely unreachable
+  // Local fallback answer if backend is unreachable
   const getLocalFallbackAnswer = (q, l) => {
     const qLower = q.toLowerCase();
     const c = copyFor(l);
@@ -204,7 +290,7 @@ const SautiLearnPage = ({ onNavigate }) => {
     if (qLower.includes('siri') || qLower.includes('secret') || qLower.includes('private')) {
       return c.lessons.find((item) => item.id === 'secret')?.content;
     }
-    if (qLower.includes('ussd') || qLower.includes('mtandao') || qLower.includes('simu ndogo') || qLower.includes('internet')) {
+    if (qLower.includes('ussd') || qLower.includes('mtandao') || qLower.includes('simu') || qLower.includes('internet') || qLower.includes('384')) {
       return c.lessons.find((item) => item.id === 'ussd')?.content;
     }
     if (qLower.includes('hesabiwa') || qLower.includes('risiti') || qLower.includes('counted') || qLower.includes('verify')) {
@@ -326,7 +412,6 @@ const SautiLearnPage = ({ onNavigate }) => {
             speakWithDeviceVoice(finalAnswer, data.lang || lang);
           }
         } catch (_) {
-          // If server failed, check if we have a live transcript to fall back on
           if (transcript) {
             const fallback = getLocalFallbackAnswer(transcript, lang);
             setAnswer(fallback);
@@ -356,7 +441,6 @@ const SautiLearnPage = ({ onNavigate }) => {
     } catch (_) {}
   };
 
-  // Play a specific lesson aloud
   const playLessonAudio = (lesson) => {
     stopAudio();
     setAnswer(lesson.content);
@@ -365,27 +449,30 @@ const SautiLearnPage = ({ onNavigate }) => {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-gray-50 to-emerald-50/20 text-gray-800">
-      {/* Hero Header */}
-      <div className="bg-gradient-to-r from-emerald-800 via-emerald-700 to-teal-800 text-white shadow-md">
+    <div className="min-h-screen bg-gradient-to-b from-gray-50 via-emerald-50/20 to-gray-50 text-gray-800">
+      {/* Top Banner */}
+      <div className="bg-gradient-to-r from-emerald-900 via-emerald-800 to-teal-900 text-white shadow-md">
         <div className="max-w-5xl mx-auto px-4 py-8 sm:py-10">
           <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <div>
-              <div className="inline-flex items-center gap-2 px-3 py-1 bg-white/15 backdrop-blur-sm rounded-full text-xs font-semibold text-emerald-100 tracking-wide uppercase mb-2">
-                <span>🇰🇪 DeVote Kenya</span>
-                <span>•</span>
+              <div className="inline-flex items-center gap-2 px-3 py-1 bg-white/10 backdrop-blur-sm rounded-full text-xs font-semibold text-emerald-200 uppercase tracking-wide mb-2.5">
+                <span>DeVote Kenya</span>
+                <span className="w-1 h-1 rounded-full bg-emerald-400" />
+                <span>USSD *384*41484#</span>
+                <span className="w-1 h-1 rounded-full bg-emerald-400" />
                 <span>{copy.tagline}</span>
               </div>
-              <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight">
-                🔊 {copy.title}
+              <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight flex items-center gap-3">
+                <Icons.Speaker className="w-8 h-8 text-emerald-300" />
+                <span>{copy.title}</span>
               </h1>
-              <p className="mt-2 text-emerald-100/90 text-sm sm:text-base max-w-2xl leading-relaxed">
+              <p className="mt-2 text-emerald-100 text-sm sm:text-base max-w-2xl leading-relaxed">
                 {copy.subtitle}
               </p>
             </div>
 
             {/* Language Switcher */}
-            <div className="flex flex-col items-start sm:items-end gap-1.5 self-start sm:self-center bg-black/20 p-2 rounded-2xl border border-white/10">
+            <div className="flex flex-col items-start sm:items-end gap-1.5 self-start sm:self-center bg-black/25 p-2 rounded-2xl border border-white/10">
               <span className="text-[11px] text-emerald-200 font-medium px-2">
                 {copy.langSwitchLabel}
               </span>
@@ -397,10 +484,10 @@ const SautiLearnPage = ({ onNavigate }) => {
                       stopAudio();
                       setLang(l.code);
                     }}
-                    className={`px-3.5 py-1.5 rounded-xl text-xs sm:text-sm font-semibold transition-all shadow-sm ${
+                    className={`px-4 py-1.5 rounded-xl text-xs sm:text-sm font-semibold transition-all ${
                       lang === l.code
-                        ? 'bg-white text-emerald-900 shadow-md scale-105'
-                        : 'bg-white/15 text-white hover:bg-white/25 hover:text-white'
+                        ? 'bg-white text-emerald-900 shadow-md font-bold'
+                        : 'bg-white/15 text-white hover:bg-white/25'
                     }`}
                   >
                     {l.label}
@@ -414,23 +501,25 @@ const SautiLearnPage = ({ onNavigate }) => {
           <div className="mt-8 flex gap-2 border-b border-white/15 pb-2">
             <button
               onClick={() => setActiveTab('qa')}
-              className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${
+              className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors flex items-center gap-2 ${
                 activeTab === 'qa'
                   ? 'bg-white text-emerald-900 shadow'
                   : 'text-white/80 hover:bg-white/10'
               }`}
             >
-              🎙️ {lang === 'sw' ? 'Uliza kwa Sauti / Maandishi' : 'Voice & Text Q&A'}
+              <Icons.Mic className="w-4 h-4" />
+              <span>{lang === 'sw' ? 'Uliza kwa Sauti na Maandishi' : 'Voice & Text Q&A'}</span>
             </button>
             <button
               onClick={() => setActiveTab('lessons')}
-              className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors ${
+              className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors flex items-center gap-2 ${
                 activeTab === 'lessons'
                   ? 'bg-white text-emerald-900 shadow'
                   : 'text-white/80 hover:bg-white/10'
               }`}
             >
-              📘 {copy.lessonsTitle}
+              <Icons.Book className="w-4 h-4" />
+              <span>{copy.lessonsTitle}</span>
             </button>
           </div>
         </div>
@@ -439,11 +528,12 @@ const SautiLearnPage = ({ onNavigate }) => {
       {/* Main Content Area */}
       <div className="max-w-5xl mx-auto px-4 py-8">
         {!serviceUp && (
-          <div className="mb-6 bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl p-4 text-xs sm:text-sm flex items-center gap-2 shadow-sm">
-            <span>ℹ️</span>
+          <div className="mb-6 bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl p-4 text-xs sm:text-sm flex items-center gap-2.5 shadow-sm">
+            <Icons.Info className="w-5 h-5 text-amber-700 shrink-0" />
             <span>{copy.serviceDown}</span>
           </div>
         )}
+
         {activeTab === 'qa' ? (
           <div className="grid gap-6 lg:grid-cols-3">
             {/* Interactive Voice & Chat Panel */}
@@ -467,18 +557,24 @@ const SautiLearnPage = ({ onNavigate }) => {
                     <button
                       onClick={() => (status === 'recording' ? stopRecording() : startRecording())}
                       disabled={!voiceSupported}
-                      className={`relative w-32 h-32 rounded-full flex flex-col items-center justify-center text-4xl shadow-xl transition-all transform active:scale-95 ${
+                      className={`relative w-32 h-32 rounded-full flex flex-col items-center justify-center text-white shadow-xl transition-all transform active:scale-95 ${
                         status === 'recording'
-                          ? 'bg-gradient-to-tr from-red-600 to-rose-500 text-white shadow-red-200'
+                          ? 'bg-gradient-to-tr from-red-600 to-rose-500 shadow-red-200'
                           : status === 'speaking'
-                          ? 'bg-gradient-to-tr from-emerald-600 to-teal-500 text-white shadow-emerald-200 ring-4 ring-emerald-200'
-                          : 'bg-gradient-to-tr from-emerald-700 to-emerald-600 text-white hover:scale-105 shadow-emerald-200'
+                          ? 'bg-gradient-to-tr from-emerald-600 to-teal-500 shadow-emerald-200 ring-4 ring-emerald-200'
+                          : 'bg-gradient-to-tr from-emerald-700 to-emerald-600 hover:scale-105 shadow-emerald-200'
                       } ${!voiceSupported ? 'opacity-50 cursor-not-allowed' : ''}`}
                       title={status === 'recording' ? copy.micRecording : copy.micIdle}
                     >
-                      <span>{status === 'recording' ? '⏹' : status === 'speaking' ? '🔊' : '🎤'}</span>
+                      {status === 'recording' ? (
+                        <Icons.Stop className="w-10 h-10" />
+                      ) : status === 'speaking' ? (
+                        <Icons.Speaker className="w-10 h-10" />
+                      ) : (
+                        <Icons.Mic className="w-10 h-10" />
+                      )}
                       <span className="text-[11px] font-bold tracking-wider uppercase mt-1">
-                        {status === 'recording' ? `${elapsed}s` : status === 'speaking' ? copy.speaking : 'Sema'}
+                        {status === 'recording' ? `${elapsed}s` : status === 'speaking' ? copy.speaking : (lang === 'sw' ? 'Sema Sasa' : 'Speak')}
                       </span>
                     </button>
                   </div>
@@ -554,7 +650,7 @@ const SautiLearnPage = ({ onNavigate }) => {
                     className="px-5 py-3 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 disabled:hover:bg-emerald-700 text-white rounded-xl text-sm font-semibold transition-colors flex items-center gap-1.5 shadow"
                   >
                     <span>{copy.askButton}</span>
-                    <span>➤</span>
+                    <Icons.Send className="w-4 h-4" />
                   </button>
                 </form>
 
@@ -565,7 +661,7 @@ const SautiLearnPage = ({ onNavigate }) => {
                       {copy.transcriptLabel}
                     </p>
                     <p className="mt-1 text-sm sm:text-base text-gray-800 font-medium italic">
-                      “{transcript}”
+                      "{transcript}"
                     </p>
                   </div>
                 )}
@@ -575,8 +671,9 @@ const SautiLearnPage = ({ onNavigate }) => {
                   <div className="mt-4 bg-emerald-50/80 border-2 border-emerald-200 rounded-3xl p-5 sm:p-6 shadow-sm">
                     <div className="flex items-start justify-between gap-3">
                       <div className="space-y-2">
-                        <div className="inline-flex items-center gap-2 px-2.5 py-0.5 rounded-full bg-emerald-600 text-white text-xs font-bold uppercase tracking-wide">
-                          <span>🔊 {copy.answerLabel}</span>
+                        <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-700 text-white text-xs font-bold uppercase tracking-wide">
+                          <Icons.Speaker className="w-3.5 h-3.5" />
+                          <span>{copy.answerLabel}</span>
                         </div>
                         <p className="text-gray-900 text-sm sm:text-base leading-relaxed whitespace-pre-line font-normal">
                           {answer}
@@ -589,7 +686,7 @@ const SautiLearnPage = ({ onNavigate }) => {
                           className="p-2.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-medium transition-all shadow flex items-center justify-center"
                           title={copy.listenAgain}
                         >
-                          🔊
+                          <Icons.Speaker className="w-4 h-4" />
                         </button>
                         {status === 'speaking' && (
                           <button
@@ -597,7 +694,7 @@ const SautiLearnPage = ({ onNavigate }) => {
                             className="p-2.5 bg-red-100 text-red-700 hover:bg-red-200 rounded-xl text-xs font-medium transition-all flex items-center justify-center"
                             title={copy.stopSpeaking}
                           >
-                            ⏹
+                            <Icons.Mute className="w-4 h-4" />
                           </button>
                         )}
                       </div>
@@ -608,9 +705,10 @@ const SautiLearnPage = ({ onNavigate }) => {
 
               {/* Suggestions Chips */}
               <div className="bg-white rounded-3xl shadow-sm border border-gray-100 p-6">
-                <p className="text-xs font-bold uppercase tracking-wider text-gray-500 mb-3">
-                  💡 {copy.suggestionsLabel}
-                </p>
+                <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-gray-500 mb-3">
+                  <Icons.Sparkles className="w-4 h-4 text-emerald-600" />
+                  <span>{copy.suggestionsLabel}</span>
+                </div>
                 <div className="flex flex-wrap gap-2">
                   {copy.suggestions.map((s, idx) => (
                     <button
@@ -620,7 +718,7 @@ const SautiLearnPage = ({ onNavigate }) => {
                       }}
                       className="text-left px-3.5 py-2 bg-emerald-50/70 hover:bg-emerald-100 border border-emerald-200/60 rounded-xl text-xs sm:text-sm text-emerald-900 font-medium transition-all hover:scale-[1.01]"
                     >
-                      💬 {s}
+                      {s}
                     </button>
                   ))}
                 </div>
@@ -631,8 +729,9 @@ const SautiLearnPage = ({ onNavigate }) => {
             <div className="space-y-6">
               <div className="bg-white rounded-3xl shadow-sm border border-gray-100 p-6">
                 <div className="flex items-center justify-between mb-3">
-                  <h3 className="font-bold text-gray-900 text-base">
-                    📘 {copy.lessonsTitle}
+                  <h3 className="font-bold text-gray-900 text-base flex items-center gap-2">
+                    <Icons.Book className="w-5 h-5 text-emerald-700" />
+                    <span>{copy.lessonsTitle}</span>
                   </h3>
                   <button
                     onClick={() => setActiveTab('lessons')}
@@ -652,15 +751,17 @@ const SautiLearnPage = ({ onNavigate }) => {
                       onClick={() => playLessonAudio(lesson)}
                       className="w-full text-left p-3 rounded-2xl hover:bg-emerald-50 border border-gray-100 hover:border-emerald-200 transition-all group flex items-start gap-3"
                     >
-                      <span className="text-xl group-hover:scale-110 transition-transform">{lesson.icon}</span>
+                      <div className="p-2 rounded-xl bg-emerald-50 text-emerald-700 group-hover:bg-emerald-100 transition-colors">
+                        {renderTopicIcon(lesson.icon, "w-4 h-4")}
+                      </div>
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-semibold text-gray-800 group-hover:text-emerald-900 truncate">
                           {lesson.label}
                         </p>
                         <p className="text-xs text-gray-500 truncate mt-0.5">{lesson.desc}</p>
                       </div>
-                      <span className="text-xs text-emerald-700 font-bold opacity-0 group-hover:opacity-100 transition-opacity">
-                        🔊
+                      <span className="p-1 text-emerald-700 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <Icons.Speaker className="w-4 h-4" />
                       </span>
                     </button>
                   ))}
@@ -669,41 +770,56 @@ const SautiLearnPage = ({ onNavigate }) => {
 
               {/* Voter Next Actions */}
               <div className="bg-gradient-to-br from-emerald-800 to-teal-900 text-white rounded-3xl shadow-md p-6 space-y-4">
-                <h4 className="font-bold text-base">
-                  🗳️ {lang === 'sw' ? 'Hatua Yako Ifuatayo' : 'Your Next Step'}
-                </h4>
-                <p className="text-xs text-emerald-100/90 leading-relaxed">
+                <div className="flex items-center gap-2">
+                  <Icons.Ballot className="w-5 h-5 text-emerald-300" />
+                  <h4 className="font-bold text-base">
+                    {lang === 'sw' ? 'Hatua Yako Ifuatayo' : 'Your Next Step'}
+                  </h4>
+                </div>
+                <p className="text-xs text-emerald-100 leading-relaxed">
                   {lang === 'sw'
-                    ? 'Uko tayari kupiga kura au kujiandikisha? Chagua hatua hapa chini:'
-                    : 'Ready to cast your ballot or register as a voter? Choose your action below:'}
+                    ? 'Uko tayari kupiga kura au kujiandikisha? Chagua hatua au piga USSD *384*41484#:'
+                    : 'Ready to cast your ballot or register? Choose below or dial USSD *384*41484#:'}
                 </p>
                 <div className="space-y-2.5 pt-1">
                   <button
                     onClick={() => onNavigate && onNavigate('registration')}
-                    className="w-full py-3 bg-white text-emerald-900 hover:bg-emerald-50 rounded-xl text-sm font-bold shadow transition-all"
+                    className="w-full py-3 bg-white text-emerald-900 hover:bg-emerald-50 rounded-xl text-sm font-bold shadow transition-all flex items-center justify-center gap-2"
                   >
-                    📝 {copy.goRegister}
+                    <Icons.Document className="w-4 h-4" />
+                    <span>{copy.goRegister}</span>
                   </button>
                   <button
                     onClick={() => onNavigate && onNavigate('vote')}
-                    className="w-full py-3 bg-emerald-600/80 hover:bg-emerald-600 text-white rounded-xl text-sm font-bold border border-white/20 transition-all"
+                    className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-sm font-bold border border-white/20 transition-all flex items-center justify-center gap-2"
                   >
-                    🗳️ {copy.goVote}
+                    <Icons.Ballot className="w-4 h-4" />
+                    <span>{copy.goVote}</span>
                   </button>
                 </div>
               </div>
 
-              {/* Security & Free Help Hotline Banner */}
+              {/* USSD & Security Card */}
               <div className="bg-white rounded-3xl border border-gray-200 p-5 space-y-3 text-xs text-gray-600">
                 <div className="flex items-center gap-2 text-emerald-800 font-bold">
-                  <span>🔒</span>
+                  <Icons.Shield className="w-4 h-4" />
                   <span>{lang === 'sw' ? 'Usalama na Faragha' : 'Security & Privacy'}</span>
                 </div>
                 <p className="leading-relaxed">{copy.privacy}</p>
                 <hr className="border-gray-100" />
-                <div className="flex items-center justify-between text-[11px] font-medium text-gray-500 pt-1">
-                  <span>📞 IEBC: 0800 221 221</span>
-                  <span>🚨 Fraud: 1195</span>
+                <div className="space-y-1.5 text-[11px] font-medium text-gray-700">
+                  <div className="flex items-center justify-between">
+                    <span>USSD Dial Code:</span>
+                    <span className="font-bold text-emerald-800 font-mono">*384*41484#</span>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <span>Online Portal:</span>
+                    <span className="font-bold text-emerald-800">blockchainelectionsystem.netlify.app</span>
+                  </div>
+                  <div className="flex items-center justify-between pt-1 text-gray-500">
+                    <span>IEBC Toll-Free: 0800 221 221</span>
+                    <span>Fraud Line: 1195</span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -712,8 +828,9 @@ const SautiLearnPage = ({ onNavigate }) => {
           /* Full Lessons Tab */
           <div className="space-y-6">
             <div className="bg-white rounded-3xl shadow-sm border border-gray-100 p-6 sm:p-8">
-              <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-2">
-                📘 {copy.lessonsTitle}
+              <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-2 flex items-center gap-2.5">
+                <Icons.Book className="w-6 h-6 text-emerald-700" />
+                <span>{copy.lessonsTitle}</span>
               </h2>
               <p className="text-sm text-gray-600 mb-6">
                 {copy.lessonsSubtitle}
@@ -727,12 +844,14 @@ const SautiLearnPage = ({ onNavigate }) => {
                   >
                     <div>
                       <div className="flex items-center justify-between gap-2 mb-3">
-                        <span className="text-3xl">{lesson.icon}</span>
+                        <div className="p-2.5 rounded-2xl bg-emerald-100 text-emerald-800">
+                          {renderTopicIcon(lesson.icon, "w-6 h-6")}
+                        </div>
                         <button
                           onClick={() => playLessonAudio(lesson)}
-                          className="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow transition-colors"
+                          className="px-3.5 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow transition-colors"
                         >
-                          <span>🔊</span>
+                          <Icons.Speaker className="w-4 h-4" />
                           <span>{copy.listenLesson}</span>
                         </button>
                       </div>
@@ -741,15 +860,19 @@ const SautiLearnPage = ({ onNavigate }) => {
                     </div>
 
                     <div className="mt-4 pt-3 border-t border-gray-200/60 flex items-center justify-between text-xs text-emerald-800 font-semibold">
-                      <span>✓ {lang === 'sw' ? 'Mada Rasmi' : 'Verified Topic'}</span>
+                      <span className="flex items-center gap-1">
+                        <Icons.Check className="w-3.5 h-3.5" />
+                        <span>{lang === 'sw' ? 'Mada Rasmi' : 'Official Guide'}</span>
+                      </span>
                       <button
                         onClick={() => {
                           askText(lesson.label);
                           setActiveTab('qa');
                         }}
-                        className="hover:underline"
+                        className="hover:underline flex items-center gap-1"
                       >
-                        {lang === 'sw' ? 'Uliza Zaidi' : 'Ask More'} →
+                        <span>{lang === 'sw' ? 'Uliza Zaidi' : 'Ask More'}</span>
+                        <Icons.Send className="w-3 h-3" />
                       </button>
                     </div>
                   </div>
