@@ -166,10 +166,20 @@ async function refreshCandidateCache() {
             if (fsCandidatesSnap && !fsCandidatesSnap.empty) {
                 fsCandidatesSnap.forEach((docSnap) => {
                     const d = docSnap.data();
+                    const posIndex = mapPositionToIndex(d.position ?? d.positionIndex);
+                    let cName = (d.name || '').trim();
+                    const lowerName = cName.toLowerCase();
+                    if (posIndex === 0 || lowerName.includes('ruto') || lowerName.includes('matiang')) {
+                        if (lowerName.includes('ruto') || lowerName === 'candidate 1') {
+                            cName = 'Candidate 1';
+                        } else if (lowerName.includes('matiang') || lowerName === 'candidate 2') {
+                            cName = 'Candidate 2';
+                        }
+                    }
                     list.push({
                         id:           d.blockchainId || docSnap.id,
-                        name:         (d.name || '').trim(),
-                        position:     mapPositionToIndex(d.position ?? d.positionIndex),
+                        name:         cName,
+                        position:     posIndex,
                         county:       (d.county || '').trim(),
                         constituency: (d.constituency || '').trim(),
                         ward:         (d.ward || '').trim(),
@@ -212,8 +222,8 @@ async function refreshCandidateCache() {
         // 3. Fallback list if both Firestore and chain returned empty
         if (list.length === 0) {
             list = [
-                { id: 11, name: 'Fred Matiangi', position: 0, county: '', constituency: '', ward: '', voteCount: 0 },
-                { id: 12, name: 'William Ruto', position: 0, county: '', constituency: '', ward: '', voteCount: 0 },
+                { id: 11, name: 'Candidate 1', position: 0, county: '', constituency: '', ward: '', voteCount: 0 },
+                { id: 12, name: 'Candidate 2', position: 0, county: '', constituency: '', ward: '', voteCount: 0 },
                 { id: 1, name: 'Babu Owino', position: 1, county: 'Nairobi', constituency: '', ward: '', voteCount: 0 },
                 { id: 2, name: 'Johnson Sakaja', position: 1, county: 'Nairobi', constituency: '', ward: '', voteCount: 0 },
                 { id: 5, name: 'Edwin Sifuna', position: 2, county: 'Nairobi', constituency: '', ward: '', voteCount: 0 },
@@ -310,11 +320,30 @@ async function getCandidatesForPosition(posIndex, voter = null) {
         }
     }
 
+    // Deduplicate candidates by name (merging/taking max vote count)
+    const uniqueMap = new Map();
+    list.forEach(c => {
+        let name = (c.name || '').trim();
+        if (c.position === 0) {
+            const lower = name.toLowerCase();
+            if (lower.includes('ruto') || lower === 'candidate 1') name = 'Candidate 1';
+            else if (lower.includes('matiang') || lower === 'candidate 2') name = 'Candidate 2';
+        }
+        const key = `${c.position}_${name.toLowerCase()}`;
+        if (!uniqueMap.has(key)) {
+            uniqueMap.set(key, { ...c, name });
+        } else {
+            const existing = uniqueMap.get(key);
+            existing.voteCount = Math.max(existing.voteCount || 0, c.voteCount || 0);
+        }
+    });
+    list = Array.from(uniqueMap.values());
+
     if (list.length > 0) return list;
 
     // Fallback if cache is empty
     const FALLBACK = {
-        0: [{ id: 11, name: 'Fred Matiangi', voteCount: 0 }, { id: 12, name: 'William Ruto', voteCount: 0 }],
+        0: [{ id: 11, name: 'Candidate 1', voteCount: 0 }, { id: 12, name: 'Candidate 2', voteCount: 0 }],
         1: [{ id: 1, name: 'Babu Owino', voteCount: 0 }, { id: 2, name: 'Johnson Sakaja', voteCount: 0 }],
         2: [{ id: 5, name: 'Edwin Sifuna', voteCount: 0 }, { id: 6, name: 'Caleb Hamisi', voteCount: 0 }],
         3: [{ id: 3, name: 'Ester Pasaris', voteCount: 0 }, { id: 4, name: 'Mary Wanjiru', voteCount: 0 }],
@@ -852,6 +881,26 @@ async function getVoterVotingSummary(voter, nationalId) {
 // ─────────────────────────────────────────────────────────────
 function getFilteredResults(posIndex, voter) {
     let list = candidateCache.filter(c => c.position === posIndex);
+
+    // Deduplicate candidates by name and merge vote counts
+    const uniqueMap = new Map();
+    list.forEach(c => {
+        let name = (c.name || '').trim();
+        if (c.position === 0) {
+            const lower = name.toLowerCase();
+            if (lower.includes('ruto') || lower === 'candidate 1') name = 'Candidate 1';
+            else if (lower.includes('matiang') || lower === 'candidate 2') name = 'Candidate 2';
+        }
+        const key = `${c.position}_${name.toLowerCase()}`;
+        if (!uniqueMap.has(key)) {
+            uniqueMap.set(key, { ...c, name });
+        } else {
+            const existing = uniqueMap.get(key);
+            existing.voteCount = Math.max(existing.voteCount || 0, c.voteCount || 0);
+        }
+    });
+    list = Array.from(uniqueMap.values());
+
     if (!voter || posIndex === 0) {
         return list.sort((a, b) => (b.voteCount || 0) - (a.voteCount || 0));
     }
