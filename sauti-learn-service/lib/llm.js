@@ -13,14 +13,13 @@
 const { normalizeLang } = require('./i18n');
 const { FAQ, matchFaq, offlineAnswer, suggestionsFor } = require('./faq');
 
-const TIMEOUT_MS = Number(process.env.SAUTI_LLM_TIMEOUT_MS || process.env.SAUTI_REQUEST_TIMEOUT_MS || 15000);
+const TIMEOUT_MS = Number(process.env.SAUTI_LLM_TIMEOUT_MS || process.env.SAUTI_REQUEST_TIMEOUT_MS || 12000);
 const MAX_ANSWER_CHARS = Number(process.env.SAUTI_MAX_ANSWER_CHARS || 500);
 
+// Only try 2 real Gemini model names — fewer retries = less quota burn
 const GEMINI_MODEL_FALLBACKS = [
-    process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-    'gemini-3.6-flash',
-    'gemini-3.5-flash',
-    'gemini-flash-latest',
+    process.env.GEMINI_MODEL || 'gemini-1.5-flash',
+    'gemini-1.5-flash-8b',
 ];
 
 function safeTruncate(text, max) {
@@ -159,25 +158,24 @@ async function openaiAnswer(question, lang, context) {
     }
 }
 
-/* ── Race first successful provider ──────────────────────────────────────── */
-async function firstSuccess(providers) {
-    if (providers.length === 0) return null;
-    if (providers.length === 1) return providers[0]().catch(() => null);
-    return new Promise((resolve) => {
-        let remaining = providers.length;
-        let settled = false;
-        const done = (value) => {
-            if (settled) return;
-            if (value) { settled = true; resolve(value); return; }
-            remaining -= 1;
-            if (remaining === 0) { settled = true; resolve(null); }
-        };
-        providers.forEach((p) => { p().then(done, () => done(null)); });
-    });
+/* ── Sequential provider chain (Groq first → Gemini → OpenAI → FAQ) ───────
+ * We try Groq FIRST because it's faster and has its own quota.
+ * Gemini is only tried if Groq fails/unavailable.
+ * This prevents Gemini 429 spam when Gemini quota is exhausted.
+ */
+async function tryInOrder(providerFns) {
+    for (const fn of providerFns) {
+        try {
+            const result = await fn();
+            if (result) return result;
+        } catch (_) { /* continue to next */ }
+    }
+    return null;
 }
 
 /**
  * Answer a question in the declared language ('en' | 'sw').
+ * Provider order: Groq → Gemini → OpenAI → offline FAQ
  */
 async function answer(question, declaredLang) {
     const lang = normalizeLang(declaredLang);
@@ -186,17 +184,13 @@ async function answer(question, declaredLang) {
 
     const context = groundingContext(q);
 
-    const racers = [];
-    if (process.env.GEMINI_API_KEY) {
-        racers.push(() => geminiAnswer(q, lang, context));
-    }
-    if (process.env.GROQ_API_KEY) {
-        racers.push(() => groqAnswer(q, lang, context));
-    }
+    // Build ordered provider list: Groq first (fast, separate quota), then Gemini, then OpenAI
+    const providerFns = [];
+    if (process.env.GROQ_API_KEY)   providerFns.push(() => groqAnswer(q, lang, context));
+    if (process.env.GEMINI_API_KEY) providerFns.push(() => geminiAnswer(q, lang, context));
+    if (process.env.OPENAI_API_KEY) providerFns.push(() => openaiAnswer(q, lang, context));
 
-    const llmAnswer =
-        (await firstSuccess(racers)) ||
-        (await openaiAnswer(q, lang, context));
+    const llmAnswer = await tryInOrder(providerFns);
 
     if (llmAnswer) {
         return {
@@ -207,7 +201,7 @@ async function answer(question, declaredLang) {
         };
     }
 
-    // Offline FAQ fallback (no keys / offline mode)
+    // Offline FAQ fallback — always works, no API keys needed
     const off = offlineAnswer(q, lang);
     return {
         answer: off.answer,
